@@ -38,7 +38,6 @@ st.set_page_config(
 
 # ================== 通用工具函数 ==================
 
-
 def clean_and_parse_json(text: str) -> Any:
     """
     强力 JSON 清洗：
@@ -191,6 +190,39 @@ def get_feishu_content(url: str, app_id: str, app_secret: str) -> str:
         return f"⚠️ 接口调用异常 (已切换至模拟数据): {str(e)}\n\n{mock_content}"
 
 
+def build_mm_user_content(
+    prompt_text: str,
+    ui_image_b64: Optional[str],
+    ui_image_mime: Optional[str],
+    ui_detail: str = "high",
+) -> Any:
+    """
+    构造 Ark/OpenAI-compatible 多模态 content：
+    - 若无图片：返回纯文本字符串（保持你原来的行为）
+    - 若有图片：返回 [{"type":"image_url","image_url":{"url":"data:image/png;base64,..."},"detail":"high"},{"type":"text","text":"..."}]
+    注：Base64 dataURL 格式：data:image/<format>;base64,<...> :contentReference[oaicite:1]{index=1}
+        detail 字段可控制精度（high/low） :contentReference[oaicite:2]{index=2}
+    """
+    if not ui_image_b64:
+        return prompt_text
+
+    mime = (ui_image_mime or "image/png").lower().strip()
+    # 兜底：常见 jpeg 类型
+    if mime in ["image/jpg"]:
+        mime = "image/jpeg"
+
+    data_url = f"data:{mime};base64,{ui_image_b64}"
+
+    return [
+        {
+            "type": "image_url",
+            "image_url": {"url": data_url},
+            "detail": ui_detail,  # "high" 更适合 UI 小字
+        },
+        {"type": "text", "text": prompt_text},
+    ]
+
+
 def call_llm(
     api_key: str,
     model_id: str,
@@ -202,6 +234,7 @@ def call_llm(
     通用 LLM 调用封装：
     - 使用 火山引擎 Ark ChatCompletions
     - 默认返回 message.content 字符串
+    - 支持 messages[*].content 为字符串或多模态列表（image_url + text）
     """
     if not api_key:
         raise RuntimeError("未配置 API Key")
@@ -238,7 +271,6 @@ def call_llm(
 
 # ================== priority 后处理 ==================
 
-
 def post_process_priority(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     简单把 priority 分层：
@@ -273,25 +305,31 @@ def post_process_priority(features: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 # ================== CoT / 分治：功能点 + 分治生成 ==================
 
-
-def extract_features(prd_text: str, guidelines: str, api_key: str, model_id: str) -> List[Dict[str, Any]]:
+def extract_features(
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
-    阶段一：从 PRD 中抽取功能点（features）
-    返回类似：
-    [{
-      "id":"F1",
-      "name":"登录成功",
-      "desc":"...",
-      "priority":"P0",
-      "module":"登录模块",
-      "scene_type":"正向" / "异常" / "约束" / "边界" / "安全" / "其他",
-      "source_text":"来自 PRD 的关键原文片段，用于缩短后续上下文"
-    }, ...]
+    阶段一：从 PRD（或 UI 图）中抽取功能点（features）
     """
     guideline_text = guidelines.strip() or "无"
 
+    extra_note = ""
+    if (not prd_text.strip()) and ui_image_b64:
+        extra_note = """
+【补充说明】
+- 当前 PRD 文本为空，请你仅根据“UI 设计图”推断页面功能与交互，抽取功能点。
+- 若 UI 无法直接推断业务规则，请在 desc/source_text 中明确标注“待确认”，不要凭空编造规则。
+""".strip()
+
     prompt = f"""
 你是一名资深测试分析师，请从以下 PRD 中抽取功能点列表，以便后续为每个功能点设计测试用例。
+
+{extra_note}
 
 【重要要求】
 - 你的分析和输出可以使用中文或英文，但最终 JSON 中的字段值（功能点名称、描述、模块名、scene_type、source_text）一律使用简体中文。
@@ -303,11 +341,12 @@ def extract_features(prd_text: str, guidelines: str, api_key: str, model_id: str
   - "边界"：专门描述边界值/临界值规则的功能点
   - "安全"：与安全、权限、风控直接相关的功能点
   - 其他情况可以用 "其他"
-- 每个功能点尽量补充一个 source_text 字段：直接从 PRD 中复制与该功能点最相关的原文段落或小节，用于后续缩短上下文。
+- 每个功能点尽量补充一个 source_text 字段：直接从 PRD 中复制与该功能点最相关的原文段落或小节；
+  如果 PRD 为空但有 UI 图，请把你从 UI 中识别到的“字段/按钮/文案/交互提示”等写入 source_text。
 
 【输入】
-1. PRD 文本：
-{prd_text}
+1. PRD 文本（可能为空）：
+{prd_text or "（PRD 未提供）"}
 
 2. 企业测试规范（可选）：
 {guideline_text}
@@ -324,7 +363,7 @@ def extract_features(prd_text: str, guidelines: str, api_key: str, model_id: str
       "priority": "P0",
       "module": "用户登录",
       "scene_type": "正向",
-      "source_text": "从 PRD 中复制来的相关原文"
+      "source_text": "从 PRD 或 UI 中提取的相关片段"
     }}
   ]
 }}
@@ -333,7 +372,10 @@ def extract_features(prd_text: str, guidelines: str, api_key: str, model_id: str
 
     messages = [
         {"role": "system", "content": "你是一名严谨的测试分析师，负责拆解 PRD 功能点，请用简体中文输出字段值。"},
-        {"role": "user", "content": prompt},
+        {
+            "role": "user",
+            "content": build_mm_user_content(prompt, ui_image_b64, ui_image_mime, ui_detail="high"),
+        },
     ]
 
     raw = call_llm(
@@ -480,6 +522,8 @@ def generate_cases_for_feature(
     api_key: str,
     model_id: str,
     max_cases_per_feature: int,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     阶段二：针对单个功能点生成用例
@@ -489,7 +533,7 @@ def generate_cases_for_feature(
     scene_type = feature.get("scene_type", "正向")
 
     # 为了降低上下文长度，优先使用功能点自带的 source_text
-    context_text = feature.get("source_text") or prd_text
+    context_text = feature.get("source_text") or prd_text or "（PRD 未提供）"
 
     if scene_type == "异常":
         coverage_text = """
@@ -519,8 +563,18 @@ def generate_cases_for_feature(
 如果某个场景同时既是异常又是边界（例如“长度超过最大值时校验失败”），请只写一条用例，并优先将 type 标记为“边界”，不要为同一场景重复生成两条。
 """
 
+    ui_note = ""
+    if ui_image_b64 and (not prd_text.strip()):
+        ui_note = """
+【补充说明】
+- 当前 PRD 文本为空，请以“UI 设计图”为主要依据生成用例。
+- 如果 UI 无法证明某条规则（如长度/次数/锁定时长），请在用例中标注“待确认”，不要凭空编造。
+""".strip()
+
     prompt = f"""
 你是一名资深测试工程师，请针对一个具体功能点设计测试用例。
+
+{ui_note}
 
 【重要要求】
 - 所有字段内容（module/title/precondition/steps/expected/type/test_data/post_actions 等）一律使用简体中文。
@@ -533,7 +587,7 @@ def generate_cases_for_feature(
 【功能点信息】
 {json.dumps(feature, ensure_ascii=False, indent=2)}
 
-【与本功能点最相关的 PRD 原文片段】
+【与本功能点最相关的 PRD 原文片段 / UI 识别片段】
 {context_text}
 
 【企业测试规范（可选）】
@@ -573,7 +627,10 @@ def generate_cases_for_feature(
 
     messages = [
         {"role": "system", "content": "你是一名严谨的测试工程师，请用简体中文编写测试用例。"},
-        {"role": "user", "content": prompt},
+        {
+            "role": "user",
+            "content": build_mm_user_content(prompt, ui_image_b64, ui_image_mime, ui_detail="high"),
+        },
     ]
 
     raw = call_llm(
@@ -622,6 +679,8 @@ def generate_test_cases_pipeline(
     model_id: str,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     enable_semantic_dedup: bool = False,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     精细模式整体流程（分治 + 并发）：
@@ -629,15 +688,20 @@ def generate_test_cases_pipeline(
     2. 并发针对每个功能点生成用例（模型自行决定条数，至少 1）
     3. 去重（同模块 + 归一化标题；可选语义去重）
     """
-    features = extract_features(prd_text, guidelines, api_key, model_id)
+    features = extract_features(prd_text, guidelines, api_key, model_id, ui_image_b64, ui_image_mime)
     if not features:
-        raise RuntimeError("未能从 PRD 中抽取到功能点，无法生成用例。")
+        raise RuntimeError("未能从 PRD/UI 中抽取到功能点，无法生成用例。")
 
     all_cases: List[Dict[str, Any]] = []
     total = len(features)
 
     # 使用线程池并发为每个功能点生成用例
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, total)) as executor:
+    max_workers = min(4, total)
+    # 若每次都带 UI base64（体积更大），稍微保守一点
+    if ui_image_b64:
+        max_workers = min(2, total)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_feature = {
             executor.submit(
                 generate_cases_for_feature,
@@ -647,6 +711,8 @@ def generate_test_cases_pipeline(
                 api_key,
                 model_id,
                 8,  # 只是 Prompt 提示用的上限，不会硬卡
+                ui_image_b64,
+                ui_image_mime,
             ): f
             for f in features
         }
@@ -693,24 +759,39 @@ def generate_test_cases_pipeline(
 
 # ================== 快速模式：单轮生成 ==================
 
-
 def generate_test_cases_quick(
     prd_text: str,
     guidelines: str,
     api_key: str,
     model_id: str,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     快速模式：一次性调用大模型生成测试用例，不做功能点拆解。
     - 不让用户指定用例条数，让模型根据 PRD 复杂度自动决定。
     - 内部有一个安全兜底上限，防止模型异常生成过多用例。
-    返回值形式与 pipeline 一致： (features, cases)，features 这里返回空列表 []。
+    - 支持 UI 图：可仅用 UI 图生成（prd_text 可为空）
     """
-
     guideline_text = guidelines.strip() or "无"
+
+    ui_note = ""
+    if ui_image_b64 and (not prd_text.strip()):
+        ui_note = """
+【UI-only 模式说明】
+- 当前 PRD 文本为空，请你仅根据“UI 设计图”推断功能与交互，并生成测试用例。
+- 不要凭空编造复杂业务规则（如锁定次数、密码最小长度等）。如果无法从 UI 推断，请在用例中标注“待确认/需产品确认”。
+""".strip()
+    elif ui_image_b64 and prd_text.strip():
+        ui_note = """
+【UI 增强说明】
+- 你将同时看到 PRD 文本与 UI 设计图。请优先以 PRD 为准，UI 作为补充（字段/按钮/错误提示文案等）。
+""".strip()
 
     prompt = f"""
 你是一名资深测试工程师，请根据下面的 PRD 内容直接生成测试用例。
+
+{ui_note}
 
 【重要要求】
 - 所有字段内容（module/title/precondition/steps/expected/type/test_data/post_actions 等）一律使用简体中文。
@@ -720,14 +801,14 @@ def generate_test_cases_quick(
 - post_actions 字段用于描述测试结束后的清理/回滚操作，例如“删除测试账号”“还原配置”。
 - 不要输出任何解释性文字，只能输出 JSON 对象。
 
-【PRD 内容】
-{prd_text}
+【PRD 内容（可能为空）】
+{prd_text or "（PRD 未提供）"}
 
 【企业测试规范（可选）】
 {guideline_text}
 
 【任务要求】
-- 请根据 PRD 的复杂度，自动判断需要多少条测试用例：
+- 请根据 PRD/UI 的复杂度，自动判断需要多少条测试用例：
   - 如果需求比较简单，可以生成大约 5~15 条用例；
   - 如果需求包含多个模块或复杂流程，可以生成更多用例，但要避免明显重复。
 - 用例需要尽量覆盖：
@@ -761,7 +842,10 @@ def generate_test_cases_quick(
             "role": "system",
             "content": "你是一名能够快速产出高质量测试用例的资深测试工程师，请始终使用简体中文编写用例内容。",
         },
-        {"role": "user", "content": prompt},
+        {
+            "role": "user",
+            "content": build_mm_user_content(prompt, ui_image_b64, ui_image_mime, ui_detail="high"),
+        },
     ]
 
     raw = call_llm(
@@ -783,7 +867,6 @@ def generate_test_cases_quick(
 
 
 # ================== 评测相关函数 ==================
-
 
 def compute_basic_metrics(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
     """结构合规率 + 冗余度 + 模糊词数量等基础指标"""
@@ -853,13 +936,6 @@ def evaluate_against_human_by_llm(
     """
     使用 LLM 对比“AI 用例”与“人工用例”：
     - 不再做向量相似度，而是直接让 LLM 像测试经理一样判断覆盖率/精确率/F1。
-    - 返回：
-      {
-        "coverage_score": 85.0,
-        "precision_score": 78.0,
-        "f1_score": 81.2,
-        "comments": "文字点评"
-      }
     """
     if "title" not in human_df.columns:
         raise RuntimeError("人工用例 CSV/Excel 中必须包含列名为 'title' 的列")
@@ -1022,8 +1098,6 @@ def coverage_by_llm(
 ) -> Dict[str, Any]:
     """
     使用 LLM 检查“功能点覆盖率”：
-    - 输入：功能点列表 + 用例列表
-    - 输出：{coverage_score, uncovered_features, analysis}
     """
     if not features:
         raise RuntimeError("当前没有功能点列表，无法进行覆盖率分析。")
@@ -1087,8 +1161,6 @@ def hallucination_check_by_llm(
 ) -> Dict[str, Any]:
     """
     幻觉检测：
-    - 抽样若干条用例，让 LLM 判断“预期结果”是否有 PRD 依据
-    - 返回：{ suspicious_cases: [...], summary: "..." }
     """
     if not cases:
         raise RuntimeError("没有用例，无法进行幻觉检测。")
@@ -1155,8 +1227,6 @@ def improve_cases_with_llm(
 ) -> List[Dict[str, Any]]:
     """
     Self-Correction：根据评审意见自动优化用例
-    - 输入：原始 PRD、企业测试规范、当前用例、评审意见（可为空）
-    - 输出：新的 {"cases":[...]}，字段结构与原始用例一致
     """
     guideline_text = guidelines.strip() or "无"
     judge_text = json.dumps(judge_result, ensure_ascii=False, indent=2) if judge_result else "暂无评审意见"
@@ -1331,6 +1401,7 @@ with st.sidebar:
         fs_secret = st.text_input("Feishu App Secret (可选)", type="password")
         st.caption("不填则使用 Mock PRD 内容用于演示。")
 
+
 # ================== 全局状态 ==================
 
 if "prd_text" not in st.session_state:
@@ -1341,12 +1412,15 @@ if "cases" not in st.session_state:
     st.session_state["cases"] = []
 if "ui_image_b64" not in st.session_state:
     st.session_state["ui_image_b64"] = None
+if "ui_image_mime" not in st.session_state:
+    st.session_state["ui_image_mime"] = None
 if "judge_result" not in st.session_state:
     st.session_state["judge_result"] = None
 if "coverage_result" not in st.session_state:
     st.session_state["coverage_result"] = None
 if "hallucination_result" not in st.session_state:
     st.session_state["hallucination_result"] = None
+
 
 # ================== 页面布局 ==================
 
@@ -1381,10 +1455,13 @@ with tab1:
         st.markdown("#### 📸 UI 辅助生成（多模态，可选）")
         uploaded_file = st.file_uploader("上传 UI 设计图（PNG/JPG）", type=["png", "jpg", "jpeg"])
         if uploaded_file:
-            st.image(uploaded_file, caption="已启用视觉增强（目前仅加入 Prompt）", use_column_width=True)
+            st.image(uploaded_file, caption="已启用视觉增强（可用于仅 UI 图生成）", use_container_width=True)
             st.session_state["ui_image_b64"] = base64.b64encode(uploaded_file.getvalue()).decode()
+            st.session_state["ui_image_mime"] = getattr(uploaded_file, "type", None) or "image/png"
         else:
             st.session_state["ui_image_b64"] = None
+            st.session_state["ui_image_mime"] = None
+
 
 # -------- Tab2: 用例生成 & 可视化 --------
 with tab2:
@@ -1396,12 +1473,32 @@ with tab2:
         horizontal=True,
     )
 
+    # ✅ 新增：UI 图使用方式（不改其它逻辑，只在生成时决定是否带图/是否允许 PRD 为空）
+    ui_b64 = st.session_state.get("ui_image_b64")
+    ui_mime = st.session_state.get("ui_image_mime")
+
+    ui_mode_options = ["不使用", "作为补充（推荐）", "仅使用UI图（无需PRD）"]
+    default_ui_idx = 0 if not ui_b64 else 1
+    ui_mode = st.radio(
+        "UI 图使用方式（可选）",
+        ui_mode_options,
+        index=default_ui_idx,
+        horizontal=True,
+        disabled=(ui_b64 is None),
+        help="上传 UI 图后可选择：作为补充增强，或仅用 UI 图生成用例（PRD 可为空）。",
+    )
+
     if st.button("开始生成测试用例", type="primary"):
         prd_text = st.session_state["prd_text"]
+
+        # UI 参数
+        use_ui = (ui_mode != "不使用") and (ui_b64 is not None)
+        ui_only = (ui_mode == "仅使用UI图（无需PRD）") and (ui_b64 is not None)
+
         if not ark_api_key:
             st.error("请先在侧边栏配置火山引擎 API Key")
-        elif not prd_text.strip():
-            st.warning("请先在 Tab1 中输入或解析 PRD 内容")
+        elif (not prd_text.strip()) and (not ui_only):
+            st.warning("请先在 Tab1 中输入或解析 PRD 内容（或上传 UI 图并选择“仅使用UI图”）")
         else:
             if mode.startswith("快速模式"):
                 with st.spinner("🤖 正在快速生成测试用例..."):
@@ -1411,6 +1508,8 @@ with tab2:
                             guidelines=test_guidelines,
                             api_key=ark_api_key,
                             model_id=model_id,
+                            ui_image_b64=(ui_b64 if use_ui else None),
+                            ui_image_mime=(ui_mime if use_ui else None),
                         )
                         st.session_state["features"] = features
                         st.session_state["cases"] = cases
@@ -1435,7 +1534,9 @@ with tab2:
                             api_key=ark_api_key,
                             model_id=model_id,
                             progress_callback=_progress_cb,
-                            enable_semantic_dedup=False,  # 如需开启占位语义去重可设 True
+                            enable_semantic_dedup=False,
+                            ui_image_b64=(ui_b64 if use_ui else None),
+                            ui_image_mime=(ui_mime if use_ui else None),
                         )
                         st.session_state["features"] = features
                         st.session_state["cases"] = cases
@@ -1520,6 +1621,7 @@ with tab2:
             st.caption("提示：在图中可以用鼠标拖动节点、滚轮缩放查看整体结构。")
         else:
             st.info("未安装 streamlit-markmap，如需脑图请执行：`pip install streamlit-markmap` 后重启。")
+
 
 # -------- Tab3: 效果评测 & 自我修正 --------
 with tab3:
