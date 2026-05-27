@@ -3,10 +3,11 @@
 AI TestCase Agent Pro
 基于大模型从 PRD / 飞书文档 / UI 图生成测试用例，并进行离线评测、自我修正与导出。
 
-版本说明 v4：
-- Tab2 只保留“快速模式 / 精细模式”用于初版生成，不再放置重复的 LangGraph 生成按钮。
-- Tab3 统一承载 Agent 闭环：支持“基于当前用例闭环 / 快速生成后闭环 / 精细生成后闭环 / LangGraph Agent 全流程闭环”。
-- LangGraph 作为 Agent 编排层使用：生成、评测、条件判断、多轮修正、导出被组织为状态图，而不是作为普通生成按钮暴露。
+版本说明 v5：
+- Tab2 只负责“快速模式 / 精细模式”的初版用例生成与人工编辑，不再放置重复的 LangGraph 生成按钮。
+- Tab3 只保留 LangGraph Agent 作为主闭环入口，支持“从 PRD 重新生成并闭环”和“基于当前初版用例继续闭环”。
+- LangGraph 状态图包含 prepare_initial、evaluate、decide、revise、export 节点，支持条件路由、多轮修正、人工基准 F1 评测和最终导出。
+- 修复 v4 中部分环境可能出现的 Feature dataclass 命名冲突问题。
 
 运行方式：
 1) pip install -r requirements.txt
@@ -305,6 +306,13 @@ def dicts_to_cases(raw_cases: Any) -> List[Dict[str, Any]]:
 
 
 def dicts_to_features(raw_obj: Any) -> List[Dict[str, Any]]:
+    """Normalize LLM-returned feature JSON into plain dictionaries.
+
+    注意：这里不再实例化名为 Feature 的 dataclass。部分环境中 langgraph / streamlit
+    的内部对象可能与全局 Feature 名称发生歧义，导致
+    `Feature.__init__() got an unexpected keyword argument 'name'`。
+    直接构造 dict 更稳，也更适合在 LangGraph 状态中序列化传递。
+    """
     if isinstance(raw_obj, dict) and "features" in raw_obj:
         raw = raw_obj.get("features") or []
     elif isinstance(raw_obj, list):
@@ -316,17 +324,17 @@ def dicts_to_features(raw_obj: Any) -> List[Dict[str, Any]]:
     for idx, f in enumerate(raw, start=1):
         if not isinstance(f, dict):
             continue
-        feature = Feature(
-            id=str(f.get("id") or f"F{idx}"),
-            name=str(f.get("name") or f"功能点 {idx}"),
-            desc=str(f.get("desc") or ""),
-            priority=str(f.get("priority") or "P1"),
-            module=str(f.get("module") or f.get("name") or "未分模块"),
-            scene_type=normalize_feature_scene(f.get("scene_type")),
-            source_text=str(f.get("source_text") or ""),
-            rag_evidence=str(f.get("rag_evidence") or ""),
-        )
-        features.append(asdict(feature))
+        name = str(f.get("name") or f.get("title") or f"功能点 {idx}")
+        features.append({
+            "id": str(f.get("id") or f"F{idx}"),
+            "name": name,
+            "desc": str(f.get("desc") or f.get("description") or ""),
+            "priority": str(f.get("priority") or "P1"),
+            "module": str(f.get("module") or name or "未分模块"),
+            "scene_type": normalize_feature_scene(f.get("scene_type") or f.get("type")),
+            "source_text": str(f.get("source_text") or f.get("source") or ""),
+            "rag_evidence": str(f.get("rag_evidence") or f.get("evidence") or ""),
+        })
     return post_process_feature_priority(features)
 
 
@@ -1697,38 +1705,50 @@ def run_unified_agent_closed_loop(
 
 def run_langgraph_workflow(state: AgentState) -> AgentState:
     """
-    LangGraph Agent 全流程闭环。
+    LangGraph Agent 全流程闭环（面向 AI 应用开发 / Agent 开发岗位的主流程）。
 
-    这版不再把 LangGraph 当作 Tab2 里的“又一种生成模式”，而是作为 Tab3 的
-    Agent 编排层：生成初版用例 -> 评测 -> 条件判断 -> 多轮修正 -> 导出。
+    产品逻辑：
+    - Tab2 只做初版生成和人工查看；
+    - Tab3 只暴露 LangGraph Agent 闭环；
+    - LangGraph 负责编排：生成/读取初版 -> 评测 -> 条件判断 -> 多轮修正 -> 再评测 -> 导出。
 
-    LangGraph 的价值不是替换 generate_cases_pipeline / judge_by_llm 等底层函数，
-    而是把这些函数组织成可分支、可循环、可追踪的状态图。
+    支持两种启动方式：
+    1. start_mode="from_prd"：从 PRD 重新抽取功能点并生成初版用例；
+    2. start_mode="from_current"：基于 Tab2 当前初版用例继续闭环；若没有功能点，会自动从 PRD 抽取。
+
+    说明：LangGraph 不负责“让模型更聪明”，它负责让工作流可分支、可循环、可追踪、可扩展。
     """
     rag_chunks = [RagChunk(**x) for x in state.get("rag_docs", [])]
 
-    # 默认闭环参数；也允许调用方从 UI 传入。
     state.setdefault("round", 0)
     state.setdefault("max_rounds", 2)
     state.setdefault("target_coverage", 0.85)
     state.setdefault("max_hallucination_cases", 0)
     state.setdefault("min_overall_score", 8.0)
+    state.setdefault("human_match_threshold", 0.45)
     state.setdefault("history", [])
+    state.setdefault("start_mode", "from_prd")
 
     def _record(s: AgentState, stage: str, message: str) -> AgentState:
         s.setdefault("history", [])
-        s["history"].append(
-            {
-                "stage": stage,
-                "message": message,
-                "round": s.get("round", 0),
-                "time": now_str(),
-            }
-        )
+        s["history"].append({
+            "stage": stage,
+            "message": message,
+            "round": s.get("round", 0),
+            "time": now_str(),
+        })
         return s
 
-    # 如果当前环境没有安装 langgraph，则降级为普通 pipeline。
-    # 这样代码仍可运行，但 UI 会提示这是 fallback。
+    def _human_df_from_state(s: AgentState) -> pd.DataFrame:
+        records = s.get("human_cases_records") or []
+        if not records:
+            return pd.DataFrame()
+        try:
+            return pd.DataFrame(records)
+        except Exception:
+            return pd.DataFrame()
+
+    # 如果没安装 langgraph，降级运行同样的闭环逻辑，保证演示不崩。
     if not HAS_LANGGRAPH:
         out = run_closed_loop_pipeline(
             prd_text=state["prd_text"],
@@ -1743,92 +1763,169 @@ def run_langgraph_workflow(state: AgentState) -> AgentState:
             max_workers=int(state.get("max_workers", 4)),
             enable_semantic_dedup=bool(state.get("enable_semantic_dedup", True)),
         )
+        human_df = _human_df_from_state(state)
+        if not human_df.empty:
+            out["human_eval_result"] = evaluate_against_human_semantic(
+                out.get("final_cases", out.get("cases", [])),
+                human_df,
+                threshold=float(state.get("human_match_threshold", 0.45)),
+            )
         out.setdefault("history", [])
-        out["history"].append(
-            {
-                "stage": "fallback",
-                "message": "当前环境未安装 langgraph，已降级为普通闭环 pipeline。",
-                "round": 0,
-                "time": now_str(),
-            }
-        )
+        out["history"].append({
+            "stage": "fallback",
+            "message": "当前环境未安装 langgraph，已降级为普通闭环 pipeline。建议安装 langgraph 展示状态图编排能力。",
+            "round": 0,
+            "time": now_str(),
+        })
         return out
 
-    def node_generate(s: AgentState) -> AgentState:
+    def node_prepare_initial(s: AgentState) -> AgentState:
+        """准备初版：从 PRD 生成，或接收 Tab2 当前用例。"""
         chunks = [RagChunk(**x) for x in s.get("rag_docs", [])]
-        features, cases = generate_cases_pipeline(
-            prd_text=s["prd_text"],
-            guidelines=s.get("guidelines", ""),
-            api_key=s["api_key"],
-            model_id=s["model_id"],
-            rag_chunks=chunks,
-            progress_callback=None,
-            enable_semantic_dedup=bool(s.get("enable_semantic_dedup", True)),
-            ui_image_b64=s.get("ui_image_b64"),
-            ui_image_mime=s.get("ui_image_mime"),
-            max_workers=int(s.get("max_workers", 4)),
-        )
+        start_mode = s.get("start_mode", "from_prd")
+
+        if start_mode == "from_current":
+            initial_cases = s.get("initial_cases") or []
+            if not initial_cases:
+                raise RuntimeError("选择了‘基于当前初版用例闭环’，但当前没有测试用例。请先在 Tab2 生成初版用例。")
+            features = s.get("initial_features") or []
+            if not features:
+                features = extract_features(
+                    prd_text=s["prd_text"],
+                    guidelines=s.get("guidelines", ""),
+                    api_key=s["api_key"],
+                    model_id=s["model_id"],
+                    rag_chunks=chunks,
+                    ui_image_b64=s.get("ui_image_b64"),
+                    ui_image_mime=s.get("ui_image_mime"),
+                )
+            cases = renumber_cases(rule_dedup_cases(initial_cases))
+            if bool(s.get("enable_semantic_dedup", True)):
+                cases = semantic_dedup_cases(cases)
+            mode_label = "LangGraph基于当前初版闭环"
+        else:
+            features, cases = generate_cases_pipeline(
+                prd_text=s["prd_text"],
+                guidelines=s.get("guidelines", ""),
+                api_key=s["api_key"],
+                model_id=s["model_id"],
+                rag_chunks=chunks,
+                progress_callback=None,
+                enable_semantic_dedup=bool(s.get("enable_semantic_dedup", True)),
+                ui_image_b64=s.get("ui_image_b64"),
+                ui_image_mime=s.get("ui_image_mime"),
+                max_workers=int(s.get("max_workers", 4)),
+            )
+            mode_label = "LangGraph从PRD生成并闭环"
+
         s["features"] = features
         s["cases"] = cases
         s["final_cases"] = cases
         s["round"] = 0
+        s["mode_label"] = mode_label
 
         metrics = compute_basic_metrics(cases)
         s["eval_result"] = metrics
         append_version_history(
-            "LangGraph初版生成",
-            "LangGraph Agent 全流程闭环",
+            "LangGraph初版准备",
+            mode_label,
             features,
             cases,
             metrics,
-            note=f"初版生成 {len(cases)} 条用例",
+            note=f"启动方式={start_mode}，初版 {len(cases)} 条用例，功能点 {len(features)} 个。",
         )
-        return _record(s, "generate", f"完成初版生成：{len(features)} 个功能点，{len(cases)} 条用例。")
+        return _record(s, "prepare_initial", f"初版准备完成：{len(features)} 个功能点，{len(cases)} 条用例。")
 
     def node_evaluate(s: AgentState) -> AgentState:
         current_cases = s.get("final_cases") or s.get("cases", [])
         features = s.get("features", [])
+        mode_label = s.get("mode_label", "LangGraph Agent 全流程闭环")
 
         metrics = compute_basic_metrics(current_cases)
         coverage_result = feature_coverage_by_similarity(features, current_cases)
-        judge_result = judge_by_llm(
-            s["api_key"],
-            s.get("judge_model_id") or s["model_id"],
-            s["prd_text"],
-            current_cases,
-        )
-        hallucination_result = hallucination_check_by_llm(
-            s["api_key"],
-            s.get("judge_model_id") or s["model_id"],
-            s["prd_text"],
-            s.get("guidelines", ""),
-            current_cases,
-        )
+
+        # 为了控制闭环耗时和 LLM 调用成本，Judge / 幻觉检测不一定每轮都执行。
+        # 规则评测、功能点覆盖率、人工基准语义 F1 每轮都执行；
+        # 重模型评审按 eval_strategy 控制：经济 / 标准 / 深度。
+        eval_strategy = str(s.get("eval_strategy", "标准模式"))
+        current_round = int(s.get("round", 0))
+        max_rounds = int(s.get("max_rounds", 2))
+        target_coverage = float(s.get("target_coverage", 0.85))
+        coverage_score_now = float(coverage_result.get("coverage_score", 0.0) or 0.0)
+        likely_to_export = coverage_score_now >= target_coverage or current_round >= max_rounds
+
+        if eval_strategy == "深度模式":
+            run_deep_eval = True
+        elif eval_strategy == "标准模式":
+            run_deep_eval = (current_round == 0) or likely_to_export
+        else:  # 经济模式
+            run_deep_eval = likely_to_export
+
+        if run_deep_eval:
+            judge_result = judge_by_llm(
+                s["api_key"],
+                s.get("judge_model_id") or s["model_id"],
+                s["prd_text"],
+                current_cases,
+            )
+            hallucination_result = hallucination_check_by_llm(
+                s["api_key"],
+                s.get("judge_model_id") or s["model_id"],
+                s["prd_text"],
+                s.get("guidelines", ""),
+                current_cases,
+            )
+        else:
+            judge_result = {
+                "overall_score": 0.0,
+                "completeness_score": 0.0,
+                "clarity_score": 0.0,
+                "comments": f"本轮按{eval_strategy}跳过 LLM Judge，以降低耗时和调用成本。",
+                "skipped": True,
+            }
+            hallucination_result = {
+                "suspicious_cases": [],
+                "summary": f"本轮按{eval_strategy}跳过幻觉检测；最终导出前会在关键轮次执行。",
+                "skipped": True,
+            }
+
+        human_df = _human_df_from_state(s)
+        human_eval_result = {}
+        if not human_df.empty:
+            human_eval_result = evaluate_against_human_semantic(
+                current_cases,
+                human_df,
+                threshold=float(s.get("human_match_threshold", 0.45)),
+            )
 
         s["eval_result"] = metrics
         s["coverage_result"] = coverage_result
         s["judge_result"] = judge_result
         s["hallucination_result"] = hallucination_result
+        s["human_eval_result"] = human_eval_result
+
+        note_parts = [
+            f"strategy={eval_strategy}",
+            f"deep_eval={'是' if run_deep_eval else '否'}",
+            f"coverage={float(coverage_result.get('coverage_score', 0.0) or 0.0):.2f}",
+            f"overall={float(judge_result.get('overall_score', 0.0) or 0.0):.1f}",
+            f"hallu={len(hallucination_result.get('suspicious_cases', []) or [])}",
+        ]
+        if human_eval_result:
+            note_parts.append(f"human_f1={human_eval_result.get('f1_score', 0.0):.1f}%")
 
         append_version_history(
             f"LangGraph第{s.get('round', 0)}轮评测",
-            "LangGraph Agent 全流程闭环",
+            mode_label,
             features,
             current_cases,
             metrics,
             coverage_result=coverage_result,
             judge_result=judge_result,
             hallucination_result=hallucination_result,
+            note="；".join(note_parts),
         )
-
-        coverage_score = float(coverage_result.get("coverage_score", 0.0) or 0.0)
-        suspicious_count = len(hallucination_result.get("suspicious_cases", []) or [])
-        overall_score = float(judge_result.get("overall_score", 0.0) or 0.0)
-        return _record(
-            s,
-            "evaluate",
-            f"第{s.get('round', 0)}轮评测完成：coverage={coverage_score:.2f}，overall={overall_score:.1f}，疑似幻觉={suspicious_count}条。",
-        )
+        return _record(s, "evaluate", f"第{s.get('round', 0)}轮评测完成：" + "；".join(note_parts))
 
     def node_revise(s: AgentState) -> AgentState:
         current_cases = s.get("final_cases") or s.get("cases", [])
@@ -1848,19 +1945,18 @@ def run_langgraph_workflow(state: AgentState) -> AgentState:
 
         s["final_cases"] = revised
         s["round"] = int(s.get("round", 0)) + 1
-
         metrics = compute_basic_metrics(revised)
         s["eval_result"] = metrics
         append_version_history(
             f"LangGraph第{s.get('round', 0)}轮修正",
-            "LangGraph Agent 全流程闭环",
+            s.get("mode_label", "LangGraph Agent 全流程闭环"),
             s.get("features", []),
             revised,
             metrics,
             coverage_result=s.get("coverage_result"),
             judge_result=s.get("judge_result"),
             hallucination_result=s.get("hallucination_result"),
-            note=f"修正后 {len(revised)} 条用例",
+            note=f"修正后 {len(revised)} 条用例。",
         )
         return _record(s, "revise", f"完成第{s.get('round', 0)}轮自我修正，当前用例数：{len(revised)}。")
 
@@ -1868,23 +1964,21 @@ def run_langgraph_workflow(state: AgentState) -> AgentState:
         final_cases = s.get("final_cases") or s.get("cases", [])
         features = s.get("features", [])
         metrics = s.get("eval_result") or compute_basic_metrics(final_cases)
-
         prepare_export_artifacts(final_cases, features, metrics)
         append_version_history(
             "LangGraph最终导出",
-            "LangGraph Agent 全流程闭环",
+            s.get("mode_label", "LangGraph Agent 全流程闭环"),
             features,
             final_cases,
             metrics,
             coverage_result=s.get("coverage_result"),
             judge_result=s.get("judge_result"),
             hallucination_result=s.get("hallucination_result"),
-            note="CSV/Markdown/Excel 已缓存",
+            note="CSV/Markdown/Excel 已缓存，可直接下载。",
         )
         return _record(s, "export", f"最终导出完成：{len(final_cases)} 条用例。")
 
     def decide_next_step(s: AgentState) -> str:
-        """根据评测结果决定是否继续修正。"""
         coverage_result = s.get("coverage_result") or {}
         hallucination_result = s.get("hallucination_result") or {}
         judge_result = s.get("judge_result") or {}
@@ -1901,7 +1995,7 @@ def run_langgraph_workflow(state: AgentState) -> AgentState:
 
         pass_coverage = coverage_score >= target_coverage
         pass_hallucination = suspicious_count <= max_hallu
-        # LLM Judge 失败或没有返回分数时，不把 overall 作为硬门槛。
+        # 若 Judge 没有返回有效分数，不把 overall 作为硬门槛，避免流程被模型偶发失败卡死。
         pass_overall = True if overall_score <= 0 else overall_score >= min_overall_score
 
         if pass_coverage and pass_hallucination and pass_overall:
@@ -1911,28 +2005,19 @@ def run_langgraph_workflow(state: AgentState) -> AgentState:
         return "revise"
 
     graph = StateGraph(AgentState)
-    graph.add_node("generate", node_generate)
+    graph.add_node("prepare_initial", node_prepare_initial)
     graph.add_node("evaluate", node_evaluate)
     graph.add_node("revise", node_revise)
     graph.add_node("export", node_export)
 
-    graph.set_entry_point("generate")
-    graph.add_edge("generate", "evaluate")
-    graph.add_conditional_edges(
-        "evaluate",
-        decide_next_step,
-        {
-            "revise": "revise",
-            "export": "export",
-        },
-    )
+    graph.set_entry_point("prepare_initial")
+    graph.add_edge("prepare_initial", "evaluate")
+    graph.add_conditional_edges("evaluate", decide_next_step, {"revise": "revise", "export": "export"})
     graph.add_edge("revise", "evaluate")
     graph.add_edge("export", END)
 
     app = graph.compile()
-    out = app.invoke(state)
-    return out
-
+    return app.invoke(state)
 
 # ==============================
 # Export builders
@@ -2222,91 +2307,121 @@ def render_generation_tab(cfg: Dict[str, Any]) -> None:
 
 
 def render_eval_tab(cfg: Dict[str, Any]) -> None:
-    st.subheader("3. 离线评测、自我修正与版本对比")
+    st.subheader("3. LangGraph Agent 闭环、离线评测与自我修正")
     cases = st.session_state.get("cases", [])
     features = st.session_state.get("features", [])
     prd_text = st.session_state.get("prd_text", "")
 
-    st.markdown("### Agent 一键闭环执行")
-    st.caption("Tab2 只负责初版生成；Tab3 是统一闭环入口。LangGraph 作为 Agent 编排层，用于生成、评测、条件判断、多轮修正和导出。")
-    loop_options = ["基于当前用例闭环", "快速生成后闭环", "精细生成后闭环（推荐）"]
-    if cfg.get("use_langgraph"):
-        loop_options.append("LangGraph Agent 全流程闭环")
-    closed_loop_entry = st.radio(
-        "闭环入口",
-        loop_options,
-        horizontal=True,
-        help="快速/精细闭环使用普通 Python 流水线；LangGraph 闭环使用状态图编排，支持条件路由与多轮自我修正。",
+    st.markdown("### 3.1 LangGraph Agent 一键闭环")
+    st.caption(
+        "现在 Tab3 只保留 LangGraph 作为主闭环入口：它负责把初版准备、规则评测、功能点覆盖、LLM Judge、"
+        "幻觉检测、自我修正、再评测和导出组织成可循环、可分支、可追踪的 Agent 状态图。"
     )
 
-    with st.expander("LangGraph 闭环阈值（仅选择 LangGraph 时生效）", expanded=False):
-        lg_max_rounds = st.slider("最大自我修正轮数", 0, 5, 2)
+    if not HAS_LANGGRAPH:
+        st.warning("当前环境未检测到 langgraph。代码会自动降级为普通闭环 pipeline，但为了展示 Agent 开发能力，建议安装：pip install langgraph langchain-core")
+
+    st.info(
+        "最终版产品逻辑：Tab2 只用于快速/精细初版预览；Tab3 是正式 LangGraph Agent 闭环，"
+        "会统一从 PRD / UI / RAG 重新抽取功能点并生成初版，再进行评测、修正和导出。"
+    )
+
+    st.markdown("#### 人工基准用例（可选，但建议在闭环前上传）")
+    st.caption("用于离线评测 AI 用例与人工标准用例的覆盖率、精确率和 F1。闭环执行时会自动纳入版本记录。")
+    uploaded_gold_for_loop = st.file_uploader(
+        "上传人工用例 CSV / Excel（建议包含 title / steps / expected 列）",
+        type=["csv", "xlsx", "xls"],
+        key="gold_for_langgraph_loop",
+    )
+    human_match_threshold = st.slider("人工用例语义匹配阈值", 0.1, 0.9, 0.45, 0.05, key="human_match_threshold_lg")
+
+    with st.expander("LangGraph 闭环阈值与执行策略", expanded=True):
+        lg_eval_strategy = st.radio(
+            "评测策略（控制 LLM 调用次数 / 运行时间）",
+            ["经济模式", "标准模式", "深度模式"],
+            index=1,
+            horizontal=True,
+            help=(
+                "经济模式：中间尽量用规则与语义评测，只有可能导出或达到最大轮数时才做 Judge/幻觉检测；"
+                "标准模式：首轮和可能导出轮做 Judge/幻觉检测；"
+                "深度模式：每轮都做 Judge/幻觉检测，质量更稳但更慢。"
+            ),
+        )
+        lg_max_rounds = st.slider("最大自我修正轮数", 0, 5, 2, help="0 表示只评测和导出，不进入自动修正。")
         lg_target_coverage = st.slider("目标功能点覆盖率", 0.0, 1.0, 0.85, 0.05)
         lg_max_hallu = st.number_input("允许的疑似幻觉用例数", min_value=0, max_value=20, value=0, step=1)
         lg_min_overall = st.slider("最低 LLM Judge 综合分", 0.0, 10.0, 8.0, 0.5)
-    if st.button("🚀 一键运行完整 Agent 闭环并生成最终导出", type="primary"):
+        if lg_eval_strategy == "经济模式":
+            st.caption("预计耗时较短：生成/修正仍会调用 LLM，但 Judge 与幻觉检测只在关键轮次执行。")
+        elif lg_eval_strategy == "标准模式":
+            st.caption("推荐答辩使用：首轮定位问题，可能导出轮再次确认质量，兼顾效果与速度。")
+        else:
+            st.caption("质量优先：每轮完整评测，适合小 PRD 或最终验收，但 LLM 调用次数最多。")
+
+    if st.button("🚀 运行 LangGraph Agent 完整闭环并生成最终导出", type="primary"):
         if not cfg["api_key"]:
             st.error("请先配置 Ark API Key")
-        elif closed_loop_entry.startswith("基于当前") and not cases:
-            st.error("当前没有用例。请先在 Tab2 生成初版，或选择“快速生成后闭环/精细生成后闭环”。")
         elif not prd_text.strip() and not st.session_state.get("ui_image_b64"):
             st.error("请先输入 PRD，或上传 UI 图。")
         else:
             status = st.empty()
+
             def cb(msg: str) -> None:
                 status.info(msg)
-            with st.spinner("正在运行完整 Agent 闭环..."):
+
+            human_records: List[Dict[str, Any]] = []
+            if uploaded_gold_for_loop is not None:
+                try:
+                    human_df_for_loop = read_uploaded_human_cases(uploaded_gold_for_loop)
+                    human_records = human_df_for_loop.fillna("").to_dict(orient="records")
+                    st.session_state["uploaded_human_cases_records"] = human_records
+                except Exception as e:
+                    st.error(f"人工基准用例读取失败：{e}")
+                    return
+
+            with st.spinner("正在运行 LangGraph Agent 闭环..."):
                 rag_chunks = [RagChunk(**x) for x in st.session_state.get("rag_chunks", [])]
-                if closed_loop_entry.startswith("LangGraph"):
-                    cb("正在通过 LangGraph 状态图运行完整 Agent 闭环...")
-                    state: AgentState = {
-                        "prd_text": prd_text,
-                        "guidelines": cfg["guidelines"],
-                        "api_key": cfg["api_key"],
-                        "model_id": cfg["model_id"],
-                        "judge_model_id": cfg["judge_model_id"],
-                        "rag_docs": [asdict(x) for x in rag_chunks],
-                        "ui_image_b64": st.session_state.get("ui_image_b64"),
-                        "ui_image_mime": st.session_state.get("ui_image_mime"),
-                        "max_workers": cfg["max_workers"],
-                        "enable_semantic_dedup": cfg["use_semantic_dedup"],
-                        "max_rounds": lg_max_rounds,
-                        "target_coverage": lg_target_coverage,
-                        "max_hallucination_cases": int(lg_max_hallu),
-                        "min_overall_score": lg_min_overall,
-                    }
-                    out = run_langgraph_workflow(state)
-                else:
-                    out = run_unified_agent_closed_loop(
-                        closed_loop_entry=closed_loop_entry,
-                        prd_text=prd_text,
-                        guidelines=cfg["guidelines"],
-                        api_key=cfg["api_key"],
-                        model_id=cfg["model_id"],
-                        judge_model_id=cfg["judge_model_id"],
-                        rag_chunks=rag_chunks,
-                        current_features=features,
-                        current_cases=cases,
-                        ui_image_b64=st.session_state.get("ui_image_b64"),
-                        ui_image_mime=st.session_state.get("ui_image_mime"),
-                        max_workers=cfg["max_workers"],
-                        enable_semantic_dedup=cfg["use_semantic_dedup"],
-                        progress_callback=cb,
-                    )
+                cb("正在通过 LangGraph 状态图执行：prepare_initial → evaluate → decide → revise/export ...")
+                state: AgentState = {
+                    "prd_text": prd_text,
+                    "guidelines": cfg["guidelines"],
+                    "api_key": cfg["api_key"],
+                    "model_id": cfg["model_id"],
+                    "judge_model_id": cfg["judge_model_id"],
+                    "rag_docs": [asdict(x) for x in rag_chunks],
+                    "ui_image_b64": st.session_state.get("ui_image_b64"),
+                    "ui_image_mime": st.session_state.get("ui_image_mime"),
+                    "max_workers": cfg["max_workers"],
+                    "enable_semantic_dedup": cfg["use_semantic_dedup"],
+                    "max_rounds": lg_max_rounds,
+                    "target_coverage": lg_target_coverage,
+                    "max_hallucination_cases": int(lg_max_hallu),
+                    "min_overall_score": lg_min_overall,
+                    "human_match_threshold": human_match_threshold,
+                    "human_cases_records": human_records,
+                    "eval_strategy": lg_eval_strategy,
+                    "start_mode": "from_prd",
+                    # 保留 initial_cases / initial_features 字段，便于后续扩展“复用当前初版”的高级入口；
+                    # 当前正式业务流程固定从 PRD 重新生成，保证功能点基准与用例生成一致。
+                    "initial_cases": cases,
+                    "initial_features": features,
+                }
+                out = run_langgraph_workflow(state)
+
                 st.session_state["features"] = out.get("features", [])
                 st.session_state["cases"] = out.get("final_cases", out.get("cases", []))
                 st.session_state["eval_result"] = out.get("eval_result")
                 st.session_state["coverage_result"] = out.get("coverage_result")
                 st.session_state["judge_result"] = out.get("judge_result")
                 st.session_state["hallucination_result"] = out.get("hallucination_result")
-                if closed_loop_entry.startswith("LangGraph"):
-                    st.session_state["last_langgraph_history"] = out.get("history", [])
-                st.success(f"完整闭环已完成：{closed_loop_entry}，最终用例与导出文件已更新。")
+                st.session_state["human_eval_result"] = out.get("human_eval_result")
+                st.session_state["last_langgraph_history"] = out.get("history", [])
+                st.success("LangGraph Agent 闭环已完成，最终用例与导出文件已更新。")
                 st.rerun()
 
     artifacts = st.session_state.get("export_artifacts") or {}
     if artifacts:
-        st.markdown("#### 已生成导出文件")
+        st.markdown("#### 最终导出文件")
         d1, d2, d3 = st.columns(3)
         d1.download_button("下载最终 CSV", artifacts.get("csv", b""), file_name="final_testcases.csv", mime="text/csv")
         d2.download_button("下载最终 Markdown", artifacts.get("markdown", b""), file_name="final_testcases.md", mime="text/markdown")
@@ -2314,16 +2429,18 @@ def render_eval_tab(cfg: Dict[str, Any]) -> None:
         st.caption(f"导出生成时间：{st.session_state.get('export_ready_time', '')}")
 
     if st.session_state.get("last_langgraph_history"):
-        with st.expander("LangGraph Agent 执行轨迹", expanded=False):
-            st.dataframe(pd.DataFrame(st.session_state["last_langgraph_history"]), use_container_width=True, height=220)
+        with st.expander("LangGraph Agent 执行轨迹", expanded=True):
+            st.dataframe(pd.DataFrame(st.session_state["last_langgraph_history"]), use_container_width=True, height=240)
 
+    cases = st.session_state.get("cases", [])
+    features = st.session_state.get("features", [])
     if not cases:
-        st.info("当前还没有测试用例。可以点击上方按钮直接运行完整闭环。")
+        st.info("当前还没有测试用例。可以直接点击上方按钮，让 LangGraph 从 PRD 重新生成并闭环。")
         return
 
+    st.markdown("### 3.2 当前最终用例质量概览")
     metrics = compute_basic_metrics(cases)
     st.session_state["eval_result"] = metrics
-    st.markdown("### 规则指标")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("用例数", metrics["total"])
     c2.metric("格式合规率", f"{metrics['format_rate'] * 100:.1f}%")
@@ -2344,15 +2461,48 @@ def render_eval_tab(cfg: Dict[str, Any]) -> None:
     fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### 人工基准对齐评测")
-    uploaded_gold = st.file_uploader("上传人工用例 CSV / Excel（建议包含 title/steps/expected 列）", type=["csv", "xlsx", "xls"])
-    sim_threshold = st.slider("语义匹配阈值", 0.1, 0.9, 0.45, 0.05)
-    if st.button("计算人工基准覆盖率 / 精确率 / F1"):
+    st.markdown("### 3.3 最近一次闭环评测结果")
+    rr1, rr2, rr3 = st.columns(3)
+    coverage_result = st.session_state.get("coverage_result") or {}
+    judge_result = st.session_state.get("judge_result") or {}
+    hallucination_result = st.session_state.get("hallucination_result") or {}
+    rr1.metric("功能点覆盖率", f"{float(coverage_result.get('coverage_score', 0.0) or 0.0) * 100:.1f}%")
+    rr2.metric("LLM Judge 综合分", f"{float(judge_result.get('overall_score', 0.0) or 0.0):.1f}/10")
+    rr3.metric("疑似幻觉用例数", len(hallucination_result.get("suspicious_cases", []) or []))
+
+    human_eval = st.session_state.get("human_eval_result") or {}
+    if human_eval:
+        st.markdown("#### 人工基准对齐结果")
+        h1, h2, h3 = st.columns(3)
+        h1.metric("人工覆盖率", f"{human_eval.get('coverage_score', 0.0):.1f}%")
+        h2.metric("AI 精确率", f"{human_eval.get('precision_score', 0.0):.1f}%")
+        h3.metric("F1", f"{human_eval.get('f1_score', 0.0):.1f}%")
+        st.caption(human_eval.get("comments", ""))
+        if human_eval.get("matches"):
+            with st.expander("人工用例匹配明细", expanded=False):
+                st.dataframe(pd.DataFrame(human_eval["matches"]), use_container_width=True)
+
+    st.markdown("### 3.4 手动补充人工基准评测（可选）")
+    uploaded_gold_manual = st.file_uploader(
+        "上传人工用例 CSV / Excel 后手动计算当前最终版的覆盖率 / 精确率 / F1",
+        type=["csv", "xlsx", "xls"],
+        key="gold_manual_after_loop",
+    )
+    sim_threshold = st.slider("手动评测语义匹配阈值", 0.1, 0.9, 0.45, 0.05, key="manual_human_threshold")
+    if st.button("计算当前最终版与人工基准的 F1"):
         try:
-            human_df = read_uploaded_human_cases(uploaded_gold)
+            human_df = read_uploaded_human_cases(uploaded_gold_manual)
             result = evaluate_against_human_semantic(cases, human_df, threshold=sim_threshold)
             st.session_state["human_eval_result"] = result
-            append_version_history("人工基准语义评测", "手动评测", features, cases, metrics, st.session_state.get("coverage_result"), note=f"F1={result.get('f1_score', 0):.1f}%")
+            append_version_history(
+                "人工基准语义评测",
+                "手动评测",
+                features,
+                cases,
+                metrics,
+                st.session_state.get("coverage_result"),
+                note=f"F1={result.get('f1_score', 0):.1f}%",
+            )
             a, b, c = st.columns(3)
             a.metric("覆盖率", f"{result['coverage_score']:.1f}%")
             b.metric("精确率", f"{result['precision_score']:.1f}%")
@@ -2362,80 +2512,6 @@ def render_eval_tab(cfg: Dict[str, Any]) -> None:
                 st.dataframe(pd.DataFrame(result["matches"]), use_container_width=True)
         except Exception as e:
             st.error(f"评测失败：{e}")
-
-    st.markdown("### 功能点覆盖检查")
-    col_a, col_b = st.columns(2)
-    if col_a.button("规则/Embedding 覆盖检查"):
-        result = feature_coverage_by_similarity(features, cases)
-        st.session_state["coverage_result"] = result
-        append_version_history("功能点覆盖检查", "手动评测", features, cases, metrics, coverage_result=result)
-        st.success(f"功能点覆盖率：{result['coverage_score'] * 100:.1f}%")
-        st.dataframe(pd.DataFrame(result.get("details", [])), use_container_width=True)
-    if col_b.button("LLM 覆盖检查"):
-        if not cfg["api_key"]:
-            st.error("请配置 API Key")
-        else:
-            with st.spinner("正在调用评审模型..."):
-                result = coverage_by_llm(cfg["api_key"], cfg["judge_model_id"], prd_text, features, cases)
-                st.session_state["coverage_result"] = result
-                append_version_history("LLM覆盖检查", "手动评测", features, cases, metrics, coverage_result=result)
-                st.json(result)
-
-    st.markdown("### LLM Judge / 幻觉检查 / 自我修正")
-    j1, j2, j3 = st.columns(3)
-    if j1.button("🧠 LLM 质量评审"):
-        if not cfg["api_key"]:
-            st.error("请配置 API Key")
-        else:
-            with st.spinner("正在评审..."):
-                result = judge_by_llm(cfg["api_key"], cfg["judge_model_id"], prd_text, cases)
-                st.session_state["judge_result"] = result
-                append_version_history("LLM质量评审", "手动评测", features, cases, metrics, st.session_state.get("coverage_result"), judge_result=result)
-                st.json(result)
-    if j2.button("🧯 疑似幻觉检测"):
-        if not cfg["api_key"]:
-            st.error("请配置 API Key")
-        else:
-            with st.spinner("正在检查幻觉..."):
-                result = hallucination_check_by_llm(cfg["api_key"], cfg["judge_model_id"], prd_text, cfg["guidelines"], cases)
-                st.session_state["hallucination_result"] = result
-                append_version_history("疑似幻觉检测", "手动评测", features, cases, metrics, st.session_state.get("coverage_result"), st.session_state.get("judge_result"), hallucination_result=result)
-                st.json(result)
-    if j3.button("🔁 根据评审结果自动优化"):
-        if not cfg["api_key"]:
-            st.error("请配置 API Key")
-        else:
-            with st.spinner("正在优化用例..."):
-                new_cases = improve_cases_with_llm(
-                    cfg["api_key"], cfg["judge_model_id"], prd_text, cfg["guidelines"], cases,
-                    st.session_state.get("judge_result"), st.session_state.get("coverage_result"), st.session_state.get("hallucination_result")
-                )
-                old_n = len(cases)
-                st.session_state["cases"] = semantic_dedup_cases(rule_dedup_cases(new_cases))
-                st.session_state["eval_result"] = compute_basic_metrics(st.session_state["cases"])
-                st.session_state["coverage_result"] = feature_coverage_by_similarity(features, st.session_state["cases"])
-                prepare_export_artifacts(st.session_state["cases"], features, st.session_state["eval_result"])
-                append_version_history("手动自我修正并导出", "手动修正", features, st.session_state["cases"], st.session_state["eval_result"], st.session_state.get("coverage_result"), st.session_state.get("judge_result"), st.session_state.get("hallucination_result"), note=f"{old_n} 条 → {len(st.session_state['cases'])} 条")
-                st.success(f"优化完成：{old_n} 条 → {len(st.session_state['cases'])} 条，导出文件已更新")
-                st.rerun()
-
-    with st.expander("查看当前评审结果 JSON", expanded=False):
-        st.write("judge_result")
-        st.json(st.session_state.get("judge_result") or {})
-        st.write("coverage_result")
-        st.json(st.session_state.get("coverage_result") or {})
-        st.write("hallucination_result")
-        st.json(st.session_state.get("hallucination_result") or {})
-
-    st.markdown("### 版本历史")
-    hist = st.session_state.get("history", [])
-    if hist:
-        st.dataframe(pd.DataFrame(hist), use_container_width=True)
-        hist_csv = pd.DataFrame(hist).to_csv(index=False).encode("utf-8-sig")
-        st.download_button("下载版本历史 CSV", hist_csv, file_name="version_history.csv", mime="text/csv")
-    else:
-        st.caption("暂无版本历史。")
-
 
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="🧬", layout="wide", initial_sidebar_state="expanded")
