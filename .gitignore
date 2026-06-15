@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Local secrets and environment
+.env
+.env.*
+*.key
+*.pem
+
+# Runtime / generated files
+*.log
+*.tmp
+testcases.csv
+testcases.md
+testcases.xlsx
+final_testcases.csv
+final_testcases.md
+final_testcases.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
+

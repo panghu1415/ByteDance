@@ -1,0 +1,2532 @@
+# -*- coding: utf-8 -*-
+"""
+AI TestCase Agent Pro
+基于大模型从 PRD / 飞书文档 / UI 图生成测试用例，并进行离线评测、自我修正与导出。
+
+版本说明 v5：
+- Tab2 只负责“快速模式 / 精细模式”的初版用例生成与人工编辑，不再放置重复的 LangGraph 生成按钮。
+- Tab3 只保留 LangGraph Agent 作为主闭环入口，支持“从 PRD 重新生成并闭环”和“基于当前初版用例继续闭环”。
+- LangGraph 状态图包含 prepare_initial、evaluate、decide、revise、export 节点，支持条件路由、多轮修正、人工基准 F1 评测和最终导出。
+- 修复 v4 中部分环境可能出现的 Feature dataclass 命名冲突问题。
+
+运行方式：
+1) pip install -r requirements.txt
+2) streamlit run ai_testcase_agent_app.py
+
+推荐依赖：
+streamlit pandas requests plotly scikit-learn openpyxl xlsxwriter json-repair streamlit-markmap
+可选依赖：
+langgraph langchain-core sentence-transformers
+
+说明：
+- 默认使用火山引擎 Ark ChatCompletions 兼容接口。
+- 支持 Doubao / DeepSeek 等 Ark 上的模型 ID。
+- 如果没有 sentence-transformers，会自动退化为 TF-IDF 语义相似度。
+- 如果没有 langgraph，会自动使用普通 Python pipeline，不影响主流程。
+"""
+
+from __future__ import annotations
+
+import base64
+import concurrent.futures
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+
+# ==============================
+# Optional dependencies
+# ==============================
+
+try:
+    from json_repair import repair_json
+    HAS_JSON_REPAIR = True
+except Exception:
+    HAS_JSON_REPAIR = False
+
+try:
+    from streamlit_markmap import markmap
+    HAS_MARKMAP = True
+except Exception:
+    HAS_MARKMAP = False
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    HAS_SKLEARN = True
+except Exception:
+    HAS_SKLEARN = False
+
+try:
+    from sentence_transformers import SentenceTransformer
+    HAS_ST = True
+except Exception:
+    HAS_ST = False
+
+try:
+    from langgraph.graph import StateGraph, END
+    HAS_LANGGRAPH = True
+except Exception:
+    HAS_LANGGRAPH = False
+
+
+# ==============================
+# Constants and data structures
+# ==============================
+
+APP_NAME = "智测 AI Agent Pro"
+ALLOWED_TYPES = ["正向", "异常", "边界", "安全", "性能", "界面", "其他"]
+FEATURE_SCENE_TYPES = ["正向", "异常", "约束", "边界", "安全", "性能", "界面", "其他"]
+DEFAULT_ARK_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+DEFAULT_MODEL = "doubao-seed-1-6-flash-250828"
+DEFAULT_JUDGE_MODEL = "deepseek-v3-2-251201"
+
+
+@dataclass
+class Feature:
+    id: str
+    name: str
+    desc: str = ""
+    priority: str = "P1"
+    module: str = "未分模块"
+    scene_type: str = "其他"
+    source_text: str = ""
+    rag_evidence: str = ""
+
+
+@dataclass
+class TestCase:
+    id: str
+    module: str
+    title: str
+    precondition: str = ""
+    steps: str = ""
+    expected: str = ""
+    type: str = "其他"
+    test_data: str = ""
+    post_actions: str = ""
+    featureId: str = ""
+    source_feature: str = ""
+    risk_note: str = ""
+
+
+class AgentState(TypedDict, total=False):
+    prd_text: str
+    guidelines: str
+    rag_docs: List[Dict[str, Any]]
+    retrieved_context: str
+    features: List[Dict[str, Any]]
+    cases: List[Dict[str, Any]]
+    eval_result: Dict[str, Any]
+    coverage_result: Dict[str, Any]
+    hallucination_result: Dict[str, Any]
+    judge_result: Dict[str, Any]
+    final_cases: List[Dict[str, Any]]
+    api_key: str
+    model_id: str
+    judge_model_id: str
+    ui_image_b64: Optional[str]
+    ui_image_mime: Optional[str]
+
+
+# ==============================
+# General utilities
+# ==============================
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def stable_id(prefix: str, text: str, n: int = 8) -> str:
+    h = hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()[:n]
+    return f"{prefix}-{h}"
+
+
+def to_text_list(value: Any) -> str:
+    """Normalize steps/expected/post_actions into line-separated text."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(str(x).strip() for x in value if str(x).strip())
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    return str(value).strip()
+
+
+def safe_json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def clean_and_parse_json(text: str) -> Any:
+    """
+    Robust JSON parser for LLM outputs:
+    1. json.loads
+    2. json_repair
+    3. extract ```json ... ``` block
+    4. extract first JSON object/array by bracket range
+    """
+    if not isinstance(text, str):
+        raise ValueError("模型返回内容不是字符串")
+
+    raw = text.strip()
+    if not raw:
+        raise ValueError("模型返回为空")
+
+    candidates: List[str] = [raw]
+
+    fenced = re.findall(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(fenced)
+
+    # Object slice
+    obj_start, obj_end = raw.find("{"), raw.rfind("}")
+    if obj_start >= 0 and obj_end > obj_start:
+        candidates.append(raw[obj_start: obj_end + 1])
+
+    # Array slice
+    arr_start, arr_end = raw.find("["), raw.rfind("]")
+    if arr_start >= 0 and arr_end > arr_start:
+        candidates.append(raw[arr_start: arr_end + 1])
+
+    last_err: Optional[Exception] = None
+    for c in candidates:
+        c = c.strip()
+        if not c:
+            continue
+        try:
+            return json.loads(c)
+        except Exception as e:
+            last_err = e
+        if HAS_JSON_REPAIR:
+            try:
+                repaired = repair_json(c)
+                return json.loads(repaired)
+            except Exception as e:
+                last_err = e
+
+    raise ValueError(f"无法解析有效 JSON。最后错误: {last_err}; 原始返回开头: {raw[:300]}")
+
+
+def normalize_case_type(raw_type: Any) -> str:
+    if raw_type is None:
+        return "其他"
+    t = str(raw_type).strip()
+    if t in ALLOWED_TYPES:
+        return t
+    alias = {
+        "正常": "正向", "主流程": "正向", "正向用例": "正向", "成功": "正向",
+        "异常用例": "异常", "错误": "异常", "失败": "异常", "失败场景": "异常",
+        "边界值": "边界", "边界测试": "边界",
+        "安全测试": "安全", "权限": "安全",
+        "性能测试": "性能", "压测": "性能",
+        "UI": "界面", "UX": "界面", "界面测试": "界面",
+    }
+    if t in alias:
+        return alias[t]
+    lower = t.lower()
+    if lower in ["positive", "happy path", "success"]:
+        return "正向"
+    if lower in ["negative", "error", "exception", "failure"]:
+        return "异常"
+    if "boundary" in lower:
+        return "边界"
+    if "security" in lower:
+        return "安全"
+    if "performance" in lower:
+        return "性能"
+    if lower in ["ui", "ux"]:
+        return "界面"
+    return "其他"
+
+
+def normalize_feature_scene(raw: Any) -> str:
+    if raw is None:
+        return "其他"
+    t = str(raw).strip()
+    if t in FEATURE_SCENE_TYPES:
+        return t
+    if t in ["正常", "主流程", "成功"]:
+        return "正向"
+    if t in ["错误", "失败", "异常用例"]:
+        return "异常"
+    if t in ["规则", "限制", "校验"]:
+        return "约束"
+    if t in ["边界值", "临界值"]:
+        return "边界"
+    return "其他"
+
+
+def normalize_title_for_dedup(title: str) -> str:
+    t = title or ""
+    t = re.sub(r"[（(\[]?(边界值|边界|异常|正向|安全|性能|界面)[）)\]]?", "", t)
+    t = re.sub(r"\s+", "", t)
+    t = re.sub(r"[，。,.;；：:\-—_、/\\]", "", t)
+    return t.lower()
+
+
+def dicts_to_cases(raw_cases: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw_cases, dict) and "cases" in raw_cases:
+        raw = raw_cases.get("cases") or []
+    elif isinstance(raw_cases, list):
+        raw = raw_cases
+    else:
+        raise ValueError("返回 JSON 中未找到 cases 列表")
+
+    cases: List[Dict[str, Any]] = []
+    for idx, c in enumerate(raw, start=1):
+        if not isinstance(c, dict):
+            continue
+        tc = TestCase(
+            id=str(c.get("id") or f"TC-{idx:03d}"),
+            module=str(c.get("module") or "未分模块"),
+            title=str(c.get("title") or f"未命名用例 {idx}"),
+            precondition=to_text_list(c.get("precondition")),
+            steps=to_text_list(c.get("steps")),
+            expected=to_text_list(c.get("expected")),
+            type=normalize_case_type(c.get("type")),
+            test_data=to_text_list(c.get("test_data")),
+            post_actions=to_text_list(c.get("post_actions") or c.get("teardown")),
+            featureId=str(c.get("featureId") or c.get("feature_id") or ""),
+            source_feature=str(c.get("source_feature") or ""),
+            risk_note=str(c.get("risk_note") or ""),
+        )
+        cases.append(asdict(tc))
+    return renumber_cases(cases)
+
+
+def dicts_to_features(raw_obj: Any) -> List[Dict[str, Any]]:
+    """Normalize LLM-returned feature JSON into plain dictionaries.
+
+    注意：这里不再实例化名为 Feature 的 dataclass。部分环境中 langgraph / streamlit
+    的内部对象可能与全局 Feature 名称发生歧义，导致
+    `Feature.__init__() got an unexpected keyword argument 'name'`。
+    直接构造 dict 更稳，也更适合在 LangGraph 状态中序列化传递。
+    """
+    if isinstance(raw_obj, dict) and "features" in raw_obj:
+        raw = raw_obj.get("features") or []
+    elif isinstance(raw_obj, list):
+        raw = raw_obj
+    else:
+        raise ValueError("返回 JSON 中未找到 features 列表")
+
+    features: List[Dict[str, Any]] = []
+    for idx, f in enumerate(raw, start=1):
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("name") or f.get("title") or f"功能点 {idx}")
+        features.append({
+            "id": str(f.get("id") or f"F{idx}"),
+            "name": name,
+            "desc": str(f.get("desc") or f.get("description") or ""),
+            "priority": str(f.get("priority") or "P1"),
+            "module": str(f.get("module") or name or "未分模块"),
+            "scene_type": normalize_feature_scene(f.get("scene_type") or f.get("type")),
+            "source_text": str(f.get("source_text") or f.get("source") or ""),
+            "rag_evidence": str(f.get("rag_evidence") or f.get("evidence") or ""),
+        })
+    return post_process_feature_priority(features)
+
+
+def post_process_feature_priority(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not features:
+        return features
+    valid = {"P0", "P1", "P2"}
+    pri = [f.get("priority", "P1") for f in features]
+    if len(set(pri)) <= 1:
+        n = len(features)
+        for i, f in enumerate(features):
+            ratio = (i + 1) / n
+            f["priority"] = "P0" if ratio <= 0.3 else ("P1" if ratio <= 0.75 else "P2")
+    else:
+        for f in features:
+            if f.get("priority") not in valid:
+                f["priority"] = "P1"
+    return features
+
+
+def renumber_cases(cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for idx, c in enumerate(cases, start=1):
+        c["id"] = f"TC-{idx:03d}"
+    return cases
+
+
+# ==============================
+# LLM client
+# ==============================
+
+def build_mm_user_content(prompt_text: str, ui_image_b64: Optional[str], ui_image_mime: Optional[str], ui_detail: str = "high") -> Any:
+    if not ui_image_b64:
+        return prompt_text
+    mime = (ui_image_mime or "image/png").lower().strip()
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    data_url = f"data:{mime};base64,{ui_image_b64}"
+    return [
+        {"type": "image_url", "image_url": {"url": data_url}, "detail": ui_detail},
+        {"type": "text", "text": prompt_text},
+    ]
+
+
+def call_llm(
+    api_key: str,
+    model_id: str,
+    messages: List[Dict[str, Any]],
+    response_format: Optional[Dict[str, Any]] = None,
+    temperature: float = 0.2,
+    timeout: int = 240,
+    base_url: str = DEFAULT_ARK_URL,
+) -> str:
+    if not api_key:
+        raise RuntimeError("未配置 API Key")
+    payload: Dict[str, Any] = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": False,
+    }
+    if response_format is not None:
+        payload["response_format"] = response_format
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        resp = session.post(base_url, headers=headers, json=payload, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"调用 LLM 网络异常：{e}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"API Error {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+# ==============================
+# Feishu parser
+# ==============================
+
+def extract_feishu_doc_token(url: str) -> str:
+    """Extract docx/document token from Feishu URL; works for most wiki/docx links."""
+    if not url:
+        return ""
+    clean = url.strip().split("?")[0].rstrip("/")
+    parts = clean.split("/")
+    # Common: /docx/<token>, /wiki/<token>, /docs/<token>
+    for key in ["docx", "docs", "wiki"]:
+        if key in parts:
+            idx = parts.index(key)
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return parts[-1] if parts else ""
+
+
+def get_feishu_tenant_token(app_id: str, app_secret: str) -> str:
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    resp = requests.post(url, json={"app_id": app_id, "app_secret": app_secret}, timeout=20).json()
+    if resp.get("code") != 0:
+        raise RuntimeError(f"飞书鉴权失败：{resp.get('msg')}")
+    return resp["tenant_access_token"]
+
+
+def flatten_feishu_text_elements(elements: Any) -> str:
+    texts: List[str] = []
+    if not isinstance(elements, list):
+        return ""
+    for elem in elements:
+        if not isinstance(elem, dict):
+            continue
+        # docx text element
+        text_run = elem.get("text_run") or {}
+        if text_run.get("content"):
+            texts.append(str(text_run.get("content")))
+        # old doc element fallback
+        if elem.get("text"):
+            texts.append(str(elem.get("text")))
+    return "".join(texts).strip()
+
+
+def feishu_blocks_to_markdown(items: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        block_type = item.get("block_type")
+        body = item.get("body") or {}
+        text = flatten_feishu_text_elements(body.get("elements") or [])
+        if text:
+            # A light heuristic: keep headings if present, else plain line.
+            lines.append(text)
+            continue
+
+        # Try table-like structures. Feishu block types may differ by doc version.
+        table = item.get("table") or {}
+        rows = table.get("cells") or table.get("rows") or []
+        md_rows: List[List[str]] = []
+        if isinstance(rows, list):
+            for row in rows:
+                cells = row.get("cells") if isinstance(row, dict) else row
+                if not isinstance(cells, list):
+                    continue
+                row_texts: List[str] = []
+                for cell in cells:
+                    if not isinstance(cell, dict):
+                        row_texts.append(str(cell))
+                        continue
+                    cell_body = cell.get("body") or {}
+                    cell_text = flatten_feishu_text_elements(cell_body.get("elements") or [])
+                    row_texts.append(cell_text or " ")
+                if row_texts:
+                    md_rows.append(row_texts)
+        if md_rows:
+            col_num = max(len(r) for r in md_rows)
+            normalized = [r + [" "] * (col_num - len(r)) for r in md_rows]
+            lines.append("| " + " | ".join(normalized[0]) + " |")
+            lines.append("| " + " | ".join(["---"] * col_num) + " |")
+            for r in normalized[1:]:
+                lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines).strip()
+
+
+def get_feishu_content(url: str, app_id: str = "", app_secret: str = "") -> str:
+    """
+    Read Feishu docx blocks and convert to plain Markdown text.
+    If credentials are not provided, return demo mock content to keep the app runnable.
+    """
+    if not url:
+        return ""
+    mock = """
+# [演示模式] B 端管理后台登录功能 PRD
+
+## 1. 登录入口
+用户可以通过手机号 + 密码登录管理后台。
+手机号必须为 11 位数字，密码长度为 8~20 位。
+
+## 2. 异常处理
+- 手机号格式错误时，登录按钮不可提交，并提示“请输入正确手机号”。
+- 密码错误时提示“账号或密码错误”。
+- 连续 5 次密码错误后，账号锁定 30 分钟。
+
+## 3. 安全要求
+- 密码输入框需要脱敏展示。
+- 登录接口需要防止暴力破解。
+- 登录成功后跳转首页并生成登录态。
+""".strip()
+    if not app_id or not app_secret:
+        return f"【演示模式：未配置飞书 App ID / Secret】\n原链接：{url}\n\n{mock}"
+
+    try:
+        token = get_feishu_tenant_token(app_id, app_secret)
+        doc_token = extract_feishu_doc_token(url)
+        if not doc_token:
+            return f"❌ 无法从链接中解析 doc_token：{url}"
+        headers = {"Authorization": f"Bearer {token}"}
+        api = f"https://open.feishu.cn/open-apis/docx/v1/documents/{doc_token}/blocks"
+        resp = requests.get(api, headers=headers, timeout=25).json()
+        if resp.get("code") != 0:
+            return f"❌ 飞书文档读取失败：{resp.get('msg')}"
+        items = resp.get("data", {}).get("items", [])
+        text = feishu_blocks_to_markdown(items)
+        return text or "文档内容为空或解析失败。"
+    except Exception as e:
+        return f"⚠️ 飞书接口调用异常，已返回演示数据。异常：{e}\n\n{mock}"
+
+
+# ==============================
+# RAG / semantic similarity
+# ==============================
+
+@dataclass
+class RagChunk:
+    id: str
+    source: str
+    text: str
+    score: float = 0.0
+
+
+def split_text_to_chunks(text: str, source: str, chunk_size: int = 500, overlap: int = 80) -> List[RagChunk]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    # Split by paragraphs first, then merge.
+    paras = [p.strip() for p in re.split(r"\n{2,}|(?<=。)\s*", text) if p.strip()]
+    chunks: List[str] = []
+    buf = ""
+    for p in paras:
+        if len(buf) + len(p) <= chunk_size:
+            buf = (buf + "\n" + p).strip()
+        else:
+            if buf:
+                chunks.append(buf)
+            if len(p) <= chunk_size:
+                buf = p
+            else:
+                start = 0
+                while start < len(p):
+                    chunks.append(p[start:start + chunk_size])
+                    start += max(chunk_size - overlap, 1)
+                buf = ""
+    if buf:
+        chunks.append(buf)
+    return [RagChunk(id=stable_id("CH", source + c), source=source, text=c) for c in chunks]
+
+
+def similarity_matrix(texts_a: List[str], texts_b: List[str]) -> List[List[float]]:
+    if not texts_a or not texts_b:
+        return []
+    if HAS_ST:
+        try:
+            # Use a multilingual model if available locally/online. If model download fails, fallback.
+            model_name = st.session_state.get("embedding_model_name", "paraphrase-multilingual-MiniLM-L12-v2")
+            if "_st_model" not in st.session_state or st.session_state.get("_st_model_name") != model_name:
+                st.session_state["_st_model"] = SentenceTransformer(model_name)
+                st.session_state["_st_model_name"] = model_name
+            model = st.session_state["_st_model"]
+            emb_a = model.encode(texts_a, normalize_embeddings=True)
+            emb_b = model.encode(texts_b, normalize_embeddings=True)
+            sim = emb_a @ emb_b.T
+            return sim.tolist()
+        except Exception:
+            pass
+    if HAS_SKLEARN:
+        vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(2, 4))
+        all_texts = texts_a + texts_b
+        mat = vectorizer.fit_transform(all_texts)
+        sim = cosine_similarity(mat[:len(texts_a)], mat[len(texts_a):])
+        return sim.tolist()
+    # Very simple fallback: char Jaccard
+    out: List[List[float]] = []
+    for a in texts_a:
+        row = []
+        sa = set(a)
+        for b in texts_b:
+            sb = set(b)
+            row.append(len(sa & sb) / len(sa | sb) if sa and sb else 0.0)
+        out.append(row)
+    return out
+
+
+def rag_retrieve(query: str, chunks: List[RagChunk], top_k: int = 5) -> List[RagChunk]:
+    if not chunks or not query.strip():
+        return []
+    sims = similarity_matrix([query], [c.text for c in chunks])
+    if not sims:
+        return []
+    scores = sims[0]
+    ranked = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)[:top_k]
+    return [RagChunk(id=c.id, source=c.source, text=c.text, score=float(s)) for c, s in ranked]
+
+
+def build_rag_docs_from_inputs(guidelines: str, uploaded_files: List[Any]) -> List[RagChunk]:
+    chunks: List[RagChunk] = []
+    chunks.extend(split_text_to_chunks(guidelines, "侧边栏企业测试规范"))
+    for f in uploaded_files or []:
+        try:
+            name = getattr(f, "name", "uploaded_guideline")
+            data = f.getvalue()
+            if name.lower().endswith(('.txt', '.md', '.csv')):
+                text = data.decode("utf-8", errors="ignore")
+            elif name.lower().endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(io.BytesIO(data))
+                text = df.to_csv(index=False)
+            else:
+                text = data.decode("utf-8", errors="ignore")
+            chunks.extend(split_text_to_chunks(text, name))
+        except Exception:
+            continue
+    return chunks
+
+
+def format_retrieved_context(chunks: List[RagChunk]) -> str:
+    if not chunks:
+        return "无"
+    lines: List[str] = []
+    for i, c in enumerate(chunks, start=1):
+        lines.append(f"[RAG-{i}] 来源：{c.source}；相似度：{c.score:.3f}\n{c.text}")
+    return "\n\n".join(lines)
+
+
+# ==============================
+# Prompt builders and generation
+# ==============================
+
+def extract_features(
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    rag_chunks: Optional[List[RagChunk]] = None,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    query = prd_text[:1500] if prd_text else "根据 UI 图抽取功能点"
+    retrieved = rag_retrieve(query, rag_chunks or [], top_k=5)
+    rag_context = format_retrieved_context(retrieved)
+    guideline_text = guidelines.strip() or "无"
+    ui_note = ""
+    if ui_image_b64 and not prd_text.strip():
+        ui_note = "当前 PRD 文本为空，请主要根据 UI 图识别页面字段、按钮、状态和交互，无法确认的业务规则请标注“待确认”。"
+    elif ui_image_b64:
+        ui_note = "你会同时看到 PRD 和 UI 图。请以 PRD 为准，UI 图用于补充字段、按钮和文案。"
+
+    prompt = f"""
+你是一名资深测试分析师。请从 PRD / UI / 企业测试规范中抽取结构化功能点，为后续生成测试用例做准备。
+
+【UI 说明】
+{ui_note or "无"}
+
+【PRD 文本】
+{prd_text or "（PRD 未提供）"}
+
+【企业测试规范】
+{guideline_text}
+
+【RAG 检索到的相关规范 / 历史经验】
+{rag_context}
+
+【抽取要求】
+1. 尽量覆盖主流程、异常流程、边界规则、安全约束、界面要求。
+2. 每个功能点都要给出 source_text，尽量引用 PRD 原文或 UI 识别依据。
+3. 如果某个规则来自 RAG 规范而不是 PRD，请写入 rag_evidence，并在 desc 中说明是“规范补充”。
+4. 不要凭空编造具体数值；如果 PRD 和规范都没有依据，请写“待确认”。
+5. priority 只能为 P0/P1/P2；scene_type 只能为：{FEATURE_SCENE_TYPES}。
+
+【输出格式】
+只输出合法 JSON 对象：
+{{
+  "features": [
+    {{
+      "id": "F1",
+      "name": "登录成功",
+      "desc": "已注册用户输入正确手机号和密码后进入首页。",
+      "priority": "P0",
+      "module": "用户登录",
+      "scene_type": "正向",
+      "source_text": "PRD 原文或 UI 识别内容",
+      "rag_evidence": "相关规范依据，可为空"
+    }}
+  ]
+}}
+""".strip()
+    messages = [
+        {"role": "system", "content": "你是一名严谨的测试分析师，只输出 JSON，不输出解释。"},
+        {"role": "user", "content": build_mm_user_content(prompt, ui_image_b64, ui_image_mime)},
+    ]
+    raw = call_llm(api_key, model_id, messages, response_format={"type": "json_object"}, timeout=240)
+    obj = clean_and_parse_json(raw)
+    return dicts_to_features(obj)
+
+
+def build_generation_strategy(scene_type: str) -> str:
+    if scene_type == "异常":
+        return """
+该功能点本身是异常场景。请重点生成代表该异常场景的用例，不需要额外生成无关正向登录成功类用例。
+覆盖：错误输入、错误提示、状态保持、日志/安全影响、边界条件。
+""".strip()
+    if scene_type in ["约束", "边界"]:
+        return """
+该功能点是约束/边界规则。请至少覆盖：边界内合法值、最小边界、最大边界、低于最小、高于最大、空值/非法格式。
+同一场景不要重复生成，边界+异常场景优先标记为“边界”。
+""".strip()
+    if scene_type == "安全":
+        return """
+该功能点是安全相关场景。请覆盖权限控制、敏感信息保护、接口防刷、越权、注入、暴力破解或会话状态等风险。
+如果 PRD 没有明确规则，预期结果中标注“需按安全规范确认”，不要编造具体阈值。
+""".strip()
+    if scene_type == "性能":
+        return """
+该功能点是性能相关场景。请覆盖响应时间、并发、超时、降级、重试或资源限制等场景。
+若没有明确指标，请写“性能阈值待确认”。
+""".strip()
+    if scene_type == "界面":
+        return """
+该功能点是界面/交互相关场景。请覆盖字段展示、按钮状态、错误文案、加载态、空状态和交互一致性。
+""".strip()
+    return """
+该功能点是正常业务或综合场景。请至少生成核心正向流程，并根据 PRD/规范补充典型异常、边界、安全或界面场景。
+每条用例只验证一个清晰场景，避免把多个不相关检查混在一条用例中。
+""".strip()
+
+
+def generate_cases_for_feature(
+    feature: Dict[str, Any],
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    rag_chunks: Optional[List[RagChunk]] = None,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+    max_cases_per_feature: int = 8,
+) -> List[Dict[str, Any]]:
+    feature_query = " ".join([feature.get("name", ""), feature.get("desc", ""), feature.get("source_text", "")])
+    retrieved = rag_retrieve(feature_query, rag_chunks or [], top_k=4)
+    rag_context = format_retrieved_context(retrieved)
+    context_text = feature.get("source_text") or prd_text or "（无 PRD，仅根据 UI 或规范推断）"
+    scene_type = feature.get("scene_type", "其他")
+    strategy = build_generation_strategy(scene_type)
+
+    prompt = f"""
+你是一名资深测试工程师。请针对一个功能点生成结构化测试用例。
+
+【功能点】
+{safe_json_dumps(feature)}
+
+【与该功能点最相关的 PRD / UI 原文依据】
+{context_text}
+
+【企业测试规范】
+{guidelines.strip() or "无"}
+
+【RAG 检索到的相关规范 / 历史用例 / 缺陷经验】
+{rag_context}
+
+【用例设计策略】
+{strategy}
+
+【强制要求】
+1. 所有字段内容用简体中文。
+2. JSON key 用英文。
+3. type 只能为：{ALLOWED_TYPES}。
+4. test_data 要写清楚测试数据；没有则写“无特殊测试数据”。
+5. post_actions 要写清楚清理/回滚动作；没有则写“无”。
+6. expected 不得编造 PRD/规范没有依据的具体规则；如果依据不足，写“待产品/规范确认”。
+7. 参考上限 {max_cases_per_feature} 条，复杂功能可少量增加，但避免重复。
+
+【输出格式】
+只输出合法 JSON 对象：
+{{
+  "cases": [
+    {{
+      "id": "TC-001",
+      "module": "{feature.get('module', '未分模块')}",
+      "title": "用例标题",
+      "precondition": "前置条件",
+      "steps": ["步骤1", "步骤2"],
+      "expected": ["预期结果1", "预期结果2"],
+      "type": "正向",
+      "test_data": "测试数据描述或 JSON 字符串",
+      "post_actions": "清理/回滚操作",
+      "source_feature": "{feature.get('id', '')}",
+      "risk_note": "风险说明，可为空"
+    }}
+  ]
+}}
+""".strip()
+    messages = [
+        {"role": "system", "content": "你是一名严谨的测试工程师，只输出 JSON，不输出解释。"},
+        {"role": "user", "content": build_mm_user_content(prompt, ui_image_b64, ui_image_mime)},
+    ]
+    raw = call_llm(api_key, model_id, messages, response_format={"type": "json_object"}, timeout=260)
+    obj = clean_and_parse_json(raw)
+    cases = dicts_to_cases(obj)
+    for c in cases:
+        c["featureId"] = feature.get("id", "")
+        if not c.get("source_feature"):
+            c["source_feature"] = feature.get("name", "")
+    return cases
+
+
+def generate_cases_quick(
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    rag_chunks: Optional[List[RagChunk]] = None,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    retrieved = rag_retrieve(prd_text[:1500] or "UI 设计图测试用例", rag_chunks or [], top_k=6)
+    rag_context = format_retrieved_context(retrieved)
+    prompt = f"""
+你是一名资深测试工程师。请根据 PRD / UI / 企业测试规范直接生成测试用例。
+
+【PRD 文本】
+{prd_text or "（PRD 未提供，若有 UI 图请根据 UI 推断，无法确认的规则标注待确认）"}
+
+【企业测试规范】
+{guidelines.strip() or "无"}
+
+【RAG 检索上下文】
+{rag_context}
+
+【要求】
+1. 自动判断用例数量，简单需求约 5~15 条，复杂需求可以更多，但不要重复。
+2. 覆盖正向、异常、边界、安全、性能、界面等场景。
+3. 每条用例只测试一个明确场景。
+4. 不得编造 PRD 或规范中不存在的具体业务规则。
+5. 所有字段值用简体中文，type 只能为 {ALLOWED_TYPES}。
+
+【输出格式】
+只输出合法 JSON 对象：
+{{
+  "cases": [
+    {{
+      "id": "TC-001",
+      "module": "模块名称",
+      "title": "用例标题",
+      "precondition": "前置条件",
+      "steps": ["步骤1", "步骤2"],
+      "expected": ["预期结果1", "预期结果2"],
+      "type": "正向",
+      "test_data": "测试数据描述或 JSON 字符串",
+      "post_actions": "清理/回滚操作",
+      "risk_note": "风险说明，可为空"
+    }}
+  ]
+}}
+""".strip()
+    messages = [
+        {"role": "system", "content": "你是一名能够快速产出高质量测试用例的测试工程师，只输出 JSON。"},
+        {"role": "user", "content": build_mm_user_content(prompt, ui_image_b64, ui_image_mime)},
+    ]
+    raw = call_llm(api_key, model_id, messages, response_format={"type": "json_object"}, timeout=260)
+    obj = clean_and_parse_json(raw)
+    cases = dicts_to_cases(obj)
+    if len(cases) > 150:
+        cases = cases[:150]
+    return [], cases
+
+
+def rule_dedup_cases(cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: Dict[Tuple[str, str], int] = {}
+    result: List[Dict[str, Any]] = []
+    for c in cases:
+        key = (str(c.get("module", "")), normalize_title_for_dedup(str(c.get("title", ""))))
+        if key in seen:
+            old = result[seen[key]]
+            # Preserve more specific type if new one is boundary/security.
+            if old.get("type") in ["其他", "异常"] and c.get("type") in ["边界", "安全", "性能"]:
+                old["type"] = c.get("type")
+            continue
+        seen[key] = len(result)
+        result.append(c)
+    return renumber_cases(result)
+
+
+def semantic_dedup_cases(cases: List[Dict[str, Any]], sim_threshold: float = 0.88) -> List[Dict[str, Any]]:
+    if len(cases) <= 1:
+        return cases
+    texts = [f"{c.get('module','')} {c.get('title','')} {c.get('steps','')} {c.get('expected','')}" for c in cases]
+    sim = similarity_matrix(texts, texts)
+    keep = [True] * len(cases)
+    for i in range(len(cases)):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, len(cases)):
+            if not keep[j]:
+                continue
+            same_module = cases[i].get("module") == cases[j].get("module")
+            if same_module and sim and sim[i][j] >= sim_threshold:
+                # Keep richer case: longer steps+expected wins.
+                len_i = len(str(cases[i].get("steps", ""))) + len(str(cases[i].get("expected", "")))
+                len_j = len(str(cases[j].get("steps", ""))) + len(str(cases[j].get("expected", "")))
+                if len_j > len_i:
+                    keep[i] = False
+                    break
+                else:
+                    keep[j] = False
+    return renumber_cases([c for c, k in zip(cases, keep) if k])
+
+
+def generate_cases_pipeline(
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    rag_chunks: Optional[List[RagChunk]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    enable_semantic_dedup: bool = True,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+    max_workers: int = 4,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    features = extract_features(prd_text, guidelines, api_key, model_id, rag_chunks, ui_image_b64, ui_image_mime)
+    if not features:
+        raise RuntimeError("未抽取到功能点，无法生成用例。")
+
+    all_cases: List[Dict[str, Any]] = []
+    total = len(features)
+    workers = min(max_workers, total)
+    if ui_image_b64:
+        workers = min(2, workers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(
+                generate_cases_for_feature,
+                f,
+                prd_text,
+                guidelines,
+                api_key,
+                model_id,
+                rag_chunks,
+                ui_image_b64,
+                ui_image_mime,
+            ): f for f in features
+        }
+        done = 0
+        for fut in concurrent.futures.as_completed(futures):
+            f = futures[fut]
+            try:
+                cases_f = fut.result()
+                all_cases.extend(cases_f)
+            except Exception as e:
+                all_cases.append(asdict(TestCase(
+                    id=f"TC-ERR-{f.get('id','')}",
+                    module=f.get("module", "未分模块"),
+                    title=f"功能点 {f.get('id','')} 用例生成失败",
+                    precondition="无",
+                    steps="检查模型调用日志或降低并发后重试",
+                    expected=f"错误原因：{e}",
+                    type="其他",
+                    featureId=f.get("id", ""),
+                    risk_note="该条为系统错误占位，不应计入最终交付用例"
+                )))
+            finally:
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total)
+
+    cases = rule_dedup_cases(all_cases)
+    if enable_semantic_dedup:
+        cases = semantic_dedup_cases(cases, sim_threshold=0.88)
+    return features, cases
+
+
+# ==============================
+# Evaluation
+# ==============================
+
+def compute_basic_metrics(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(cases)
+    if total == 0:
+        return {
+            "total": 0,
+            "format_rate": 0.0,
+            "valid_cases": 0,
+            "redundancy": 0.0,
+            "unique_titles": 0,
+            "vague_count": 0,
+            "type_richness": 0.0,
+            "risk_score": 0.0,
+        }
+    valid = 0
+    title_keys = set()
+    vague_words = ["等等", "大概", "可能", "左右", "相关", "适当", "视情况", "尽快", "合理"]
+    vague_count = 0
+    types = set()
+    for c in cases:
+        title = str(c.get("title", "")).strip()
+        steps = str(c.get("steps", "")).strip()
+        expected = str(c.get("expected", "")).strip()
+        pre = str(c.get("precondition", "")).strip()
+        if title and steps and expected:
+            valid += 1
+        if title:
+            title_keys.add((c.get("module", ""), normalize_title_for_dedup(title)))
+        types.add(c.get("type", "其他"))
+        content = " ".join([title, pre, steps, expected])
+        vague_count += sum(content.count(w) for w in vague_words)
+    redundancy = max(0.0, 1.0 - len(title_keys) / total)
+    target_types = {"正向", "异常", "边界", "安全", "界面"}
+    type_richness = len(types & target_types) / len(target_types)
+    risk_score = max(0.0, 100.0 - vague_count * 8.0 - redundancy * 30.0)
+    return {
+        "total": total,
+        "format_rate": valid / total,
+        "valid_cases": valid,
+        "redundancy": redundancy,
+        "unique_titles": len(title_keys),
+        "vague_count": vague_count,
+        "type_richness": type_richness,
+        "risk_score": risk_score,
+    }
+
+
+def feature_coverage_by_similarity(features: List[Dict[str, Any]], cases: List[Dict[str, Any]], threshold: float = 0.35) -> Dict[str, Any]:
+    if not features:
+        return {"coverage_score": 0.0, "covered_features": [], "uncovered_features": [], "details": []}
+    if not cases:
+        return {"coverage_score": 0.0, "covered_features": [], "uncovered_features": [f.get("id") for f in features], "details": []}
+    f_texts = [f"{f.get('name','')} {f.get('desc','')} {f.get('source_text','')}" for f in features]
+    c_texts = [f"{c.get('module','')} {c.get('title','')} {c.get('steps','')} {c.get('expected','')}" for c in cases]
+    sim = similarity_matrix(f_texts, c_texts)
+    covered, uncovered, details = [], [], []
+    for i, f in enumerate(features):
+        row = sim[i] if sim else []
+        best_j = max(range(len(row)), key=lambda j: row[j]) if row else -1
+        best_score = row[best_j] if best_j >= 0 else 0.0
+        best_case = cases[best_j].get("id") if best_j >= 0 else ""
+        is_cov = best_score >= threshold or any(c.get("featureId") == f.get("id") for c in cases)
+        if is_cov:
+            covered.append(f.get("id"))
+        else:
+            uncovered.append(f.get("id"))
+        details.append({
+            "feature_id": f.get("id"),
+            "feature_name": f.get("name"),
+            "covered": is_cov,
+            "best_case": best_case,
+            "similarity": round(float(best_score), 4),
+        })
+    return {
+        "coverage_score": len(covered) / max(len(features), 1),
+        "covered_features": covered,
+        "uncovered_features": uncovered,
+        "details": details,
+    }
+
+
+def evaluate_against_human_semantic(ai_cases: List[Dict[str, Any]], human_df: pd.DataFrame, threshold: float = 0.45) -> Dict[str, Any]:
+    if human_df is None or human_df.empty:
+        return {"coverage_score": 0.0, "precision_score": 0.0, "f1_score": 0.0, "matches": [], "comments": "未提供人工基准用例。"}
+    title_col = None
+    for c in ["title", "标题", "用例标题", "case_title"]:
+        if c in human_df.columns:
+            title_col = c
+            break
+    if title_col is None:
+        title_col = human_df.columns[0]
+    human_texts = []
+    for _, row in human_df.iterrows():
+        vals = [str(v) for v in row.values if pd.notna(v)]
+        text = " ".join(vals).strip()
+        if text:
+            human_texts.append(text)
+    ai_texts = [f"{c.get('module','')} {c.get('title','')} {c.get('steps','')} {c.get('expected','')}" for c in ai_cases]
+    if not human_texts or not ai_texts:
+        return {"coverage_score": 0.0, "precision_score": 0.0, "f1_score": 0.0, "matches": [], "comments": "人工或 AI 用例为空。"}
+    sim = similarity_matrix(human_texts, ai_texts)
+    matched_h, matched_a, matches = set(), set(), []
+    # Greedy maximum pairs
+    pairs: List[Tuple[float, int, int]] = []
+    for i in range(len(human_texts)):
+        for j in range(len(ai_texts)):
+            pairs.append((float(sim[i][j]), i, j))
+    pairs.sort(reverse=True, key=lambda x: x[0])
+    for score, i, j in pairs:
+        if score < threshold:
+            break
+        if i in matched_h or j in matched_a:
+            continue
+        matched_h.add(i)
+        matched_a.add(j)
+        matches.append({
+            "human_index": i,
+            "human_case": human_texts[i][:120],
+            "ai_case_id": ai_cases[j].get("id", ""),
+            "ai_title": ai_cases[j].get("title", ""),
+            "similarity": round(score, 4),
+        })
+    coverage = len(matched_h) / len(human_texts)
+    precision = len(matched_a) / len(ai_texts)
+    f1 = 2 * coverage * precision / (coverage + precision) if coverage + precision > 0 else 0.0
+    return {
+        "coverage_score": coverage * 100,
+        "precision_score": precision * 100,
+        "f1_score": f1 * 100,
+        "matches": matches,
+        "comments": f"以阈值 {threshold:.2f} 进行语义匹配，命中 {len(matches)} 组。",
+    }
+
+
+def judge_by_llm(api_key: str, model_id: str, prd_text: str, cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    short_cases = [
+        {"id": c.get("id"), "module": c.get("module"), "title": c.get("title"), "type": c.get("type"), "steps": c.get("steps"), "expected": c.get("expected")}
+        for c in cases[:80]
+    ]
+    prompt = f"""
+你是一名严格的测试经理，需要评审 AI 生成的测试用例质量。
+
+【PRD】
+{prd_text}
+
+【测试用例】
+{safe_json_dumps(short_cases)}
+
+请从 0~10 分评估：
+1. completeness_score：主要功能、异常、边界、安全是否覆盖。
+2. clarity_score：步骤和预期是否清晰可执行。
+3. redundancy_score：是否存在重复，分数越高表示冗余越少。
+4. hallucination_risk_score：分数越高表示幻觉风险越低。
+5. overall_score：综合评分。
+
+只输出 JSON：
+{{
+  "completeness_score": 8.0,
+  "clarity_score": 8.0,
+  "redundancy_score": 8.0,
+  "hallucination_risk_score": 8.0,
+  "overall_score": 8.0,
+  "comments": "中文点评",
+  "improvement_suggestions": ["建议1", "建议2"]
+}}
+""".strip()
+    messages = [
+        {"role": "system", "content": "你是一名严谨的测试经理，只输出 JSON。"},
+        {"role": "user", "content": prompt},
+    ]
+    raw = call_llm(api_key, model_id, messages, response_format={"type": "json_object"}, timeout=260)
+    return clean_and_parse_json(raw)
+
+
+def coverage_by_llm(api_key: str, model_id: str, prd_text: str, features: List[Dict[str, Any]], cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    prompt = f"""
+你是一名资深测试经理。请检查测试用例是否覆盖功能点。
+
+【PRD】
+{prd_text}
+
+【功能点列表】
+{safe_json_dumps(features)}
+
+【测试用例简表】
+{safe_json_dumps([{k: c.get(k) for k in ['id','module','title','type','featureId']} for c in cases])}
+
+请输出 JSON：
+{{
+  "coverage_score": 0.85,
+  "uncovered_features": ["F2"],
+  "weak_features": [{{"id":"F3", "reason":"只有正向，没有异常/边界"}}],
+  "analysis": "中文分析"
+}}
+""".strip()
+    messages = [
+        {"role": "system", "content": "你是一名关注需求覆盖率的测试经理，只输出 JSON。"},
+        {"role": "user", "content": prompt},
+    ]
+    raw = call_llm(api_key, model_id, messages, response_format={"type": "json_object"}, timeout=260)
+    return clean_and_parse_json(raw)
+
+
+def hallucination_check_by_llm(api_key: str, model_id: str, prd_text: str, guidelines: str, cases: List[Dict[str, Any]], max_cases_check: int = 30) -> Dict[str, Any]:
+    sample_cases = cases[:max_cases_check]
+    prompt = f"""
+你是一名严谨的需求分析师，请检查 AI 测试用例是否存在“疑似幻觉”。
+幻觉定义：用例步骤或预期中出现 PRD / 企业规范没有依据的业务规则、阈值、流程或文案。
+
+【PRD】
+{prd_text}
+
+【企业规范】
+{guidelines or "无"}
+
+【待检查用例】
+{safe_json_dumps(sample_cases)}
+
+请输出 JSON：
+{{
+  "suspicious_cases": [
+    {{"id":"TC-003", "level":"高/中/低", "reason":"原因", "suggestion":"如何修改"}}
+  ],
+  "hallucination_rate_estimate": 0.1,
+  "summary": "中文总结"
+}}
+""".strip()
+    messages = [
+        {"role": "system", "content": "你是一名负责发现大模型幻觉问题的需求分析师，只输出 JSON。"},
+        {"role": "user", "content": prompt},
+    ]
+    raw = call_llm(api_key, model_id, messages, response_format={"type": "json_object"}, timeout=300)
+    return clean_and_parse_json(raw)
+
+
+def improve_cases_with_llm(
+    api_key: str,
+    model_id: str,
+    prd_text: str,
+    guidelines: str,
+    cases: List[Dict[str, Any]],
+    judge_result: Optional[Dict[str, Any]] = None,
+    coverage_result: Optional[Dict[str, Any]] = None,
+    hallucination_result: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    feedback = {
+        "judge_result": judge_result or {},
+        "coverage_result": coverage_result or {},
+        "hallucination_result": hallucination_result or {},
+    }
+    prompt = f"""
+你是一名资深测试专家。请根据评审反馈，对当前测试用例进行二次优化。
+
+【PRD】
+{prd_text}
+
+【企业规范】
+{guidelines or "无"}
+
+【当前测试用例】
+{safe_json_dumps(cases)}
+
+【评审反馈】
+{safe_json_dumps(feedback)}
+
+【优化要求】
+1. 补充遗漏功能点、异常、边界、安全或界面场景。
+2. 删除或合并明显重复用例。
+3. 改写不清晰步骤和预期，使其可执行、可验证。
+4. 删除/改写没有 PRD 或规范依据的幻觉内容。
+5. 保持字段结构不变，type 只能为 {ALLOWED_TYPES}。
+
+只输出 JSON：
+{{
+  "cases": [
+    {{
+      "id":"TC-001",
+      "module":"模块",
+      "title":"标题",
+      "precondition":"前置条件",
+      "steps":["步骤1"],
+      "expected":["预期1"],
+      "type":"正向",
+      "test_data":"测试数据",
+      "post_actions":"后置处理",
+      "featureId":"F1",
+      "risk_note":""
+    }}
+  ]
+}}
+""".strip()
+    messages = [
+        {"role": "system", "content": "你是一名能够根据评审意见优化测试用例的测试专家，只输出 JSON。"},
+        {"role": "user", "content": prompt},
+    ]
+    raw = call_llm(api_key, model_id, messages, response_format={"type": "json_object"}, timeout=320)
+    obj = clean_and_parse_json(raw)
+    return dicts_to_cases(obj)
+
+
+
+
+# ==============================
+# Version history and closed-loop helpers
+# ==============================
+
+def append_version_history(
+    event: str,
+    mode: str,
+    features: Optional[List[Dict[str, Any]]] = None,
+    cases: Optional[List[Dict[str, Any]]] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+    coverage_result: Optional[Dict[str, Any]] = None,
+    judge_result: Optional[Dict[str, Any]] = None,
+    hallucination_result: Optional[Dict[str, Any]] = None,
+    note: str = "",
+) -> None:
+    """Append every generation/evaluation/revision/export event as a new version row.
+
+    This fixes the old behavior where only the first generation was visible.
+    """
+    hist = st.session_state.setdefault("history", [])
+    version_no = len(hist) + 1
+    features = features if features is not None else st.session_state.get("features", [])
+    cases = cases if cases is not None else st.session_state.get("cases", [])
+    metrics = metrics if metrics is not None else compute_basic_metrics(cases)
+    coverage_result = coverage_result if coverage_result is not None else st.session_state.get("coverage_result")
+    judge_result = judge_result if judge_result is not None else st.session_state.get("judge_result")
+    hallucination_result = hallucination_result if hallucination_result is not None else st.session_state.get("hallucination_result")
+
+    row: Dict[str, Any] = {
+        "version": f"V{version_no:03d}",
+        "time": now_str(),
+        "event": event,
+        "mode": mode,
+        "case_count": len(cases or []),
+        "feature_count": len(features or []),
+        "format_rate": metrics.get("format_rate"),
+        "redundancy": metrics.get("redundancy"),
+        "type_richness": metrics.get("type_richness"),
+        "risk_score": metrics.get("risk_score"),
+        "feature_coverage": None,
+        "judge_overall": None,
+        "hallucination_count": None,
+        "note": note,
+    }
+    if isinstance(coverage_result, dict):
+        row["feature_coverage"] = coverage_result.get("coverage_score")
+    if isinstance(judge_result, dict):
+        row["judge_overall"] = judge_result.get("overall_score") or judge_result.get("score")
+    if isinstance(hallucination_result, dict):
+        suspicious = hallucination_result.get("suspicious_cases", [])
+        row["hallucination_count"] = len(suspicious) if isinstance(suspicious, list) else None
+    hist.append(row)
+
+
+def prepare_export_artifacts(cases: List[Dict[str, Any]], features: List[Dict[str, Any]], eval_result: Dict[str, Any]) -> Dict[str, bytes]:
+    """Build export files and cache them in session_state for one-click download."""
+    csv_bytes = pd.DataFrame(cases).to_csv(index=False).encode("utf-8-sig")
+    md_bytes = build_markdown_cases(cases).encode("utf-8")
+    xlsx_bytes = build_excel_bytes(cases, features, eval_result)
+    artifacts = {"csv": csv_bytes, "markdown": md_bytes, "excel": xlsx_bytes}
+    st.session_state["export_artifacts"] = artifacts
+    st.session_state["export_ready_time"] = now_str()
+    return artifacts
+
+
+def run_closed_loop_pipeline(
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    judge_model_id: str,
+    rag_chunks: Optional[List[RagChunk]] = None,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+    mode: str = "closed_loop",
+    max_workers: int = 4,
+    enable_semantic_dedup: bool = True,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> AgentState:
+    """Run the real closed loop in one call:
+    generate -> rule eval -> coverage -> LLM judge -> hallucination check -> revise -> re-evaluate -> export.
+    """
+    def report(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+
+    rag_chunks = rag_chunks or []
+    report("1/7 正在抽取功能点并生成初版用例...")
+    features, cases = generate_cases_pipeline(
+        prd_text=prd_text,
+        guidelines=guidelines,
+        api_key=api_key,
+        model_id=model_id,
+        rag_chunks=rag_chunks,
+        enable_semantic_dedup=enable_semantic_dedup,
+        ui_image_b64=ui_image_b64,
+        ui_image_mime=ui_image_mime,
+        max_workers=max_workers,
+    )
+    metrics_v1 = compute_basic_metrics(cases)
+    append_version_history("初版生成", mode, features, cases, metrics_v1)
+
+    report("2/7 正在进行功能点覆盖检查...")
+    coverage_result = feature_coverage_by_similarity(features, cases)
+    append_version_history("功能点覆盖检查", mode, features, cases, metrics_v1, coverage_result=coverage_result)
+
+    report("3/7 正在调用 LLM Judge 质量评审...")
+    judge_result = judge_by_llm(api_key, judge_model_id or model_id, prd_text, cases)
+    append_version_history("LLM质量评审", mode, features, cases, metrics_v1, coverage_result=coverage_result, judge_result=judge_result)
+
+    report("4/7 正在进行疑似幻觉检测...")
+    hallucination_result = hallucination_check_by_llm(api_key, judge_model_id or model_id, prd_text, guidelines, cases)
+    append_version_history("疑似幻觉检测", mode, features, cases, metrics_v1, coverage_result=coverage_result, judge_result=judge_result, hallucination_result=hallucination_result)
+
+    report("5/7 正在根据评审结果自动修正用例...")
+    revised_cases = improve_cases_with_llm(
+        api_key=api_key,
+        model_id=judge_model_id or model_id,
+        prd_text=prd_text,
+        guidelines=guidelines,
+        cases=cases,
+        judge_result=judge_result,
+        coverage_result=coverage_result,
+        hallucination_result=hallucination_result,
+    )
+    revised_cases = rule_dedup_cases(revised_cases)
+    if enable_semantic_dedup:
+        revised_cases = semantic_dedup_cases(revised_cases)
+
+    report("6/7 正在对修正版再次评测...")
+    final_metrics = compute_basic_metrics(revised_cases)
+    final_coverage = feature_coverage_by_similarity(features, revised_cases)
+    append_version_history(
+        "闭环修正完成",
+        mode,
+        features,
+        revised_cases,
+        final_metrics,
+        coverage_result=final_coverage,
+        judge_result=judge_result,
+        hallucination_result=hallucination_result,
+        note=f"修正前 {len(cases)} 条，修正后 {len(revised_cases)} 条",
+    )
+
+    report("7/7 正在生成导出文件...")
+    prepare_export_artifacts(revised_cases, features, final_metrics)
+    append_version_history("导出文件已生成", mode, features, revised_cases, final_metrics, coverage_result=final_coverage, note="CSV/Markdown/Excel 已缓存")
+
+    return {
+        "prd_text": prd_text,
+        "guidelines": guidelines,
+        "features": features,
+        "cases": cases,
+        "eval_result": final_metrics,
+        "coverage_result": final_coverage,
+        "judge_result": judge_result,
+        "hallucination_result": hallucination_result,
+        "final_cases": revised_cases,
+        "api_key": api_key,
+        "model_id": model_id,
+        "judge_model_id": judge_model_id,
+        "ui_image_b64": ui_image_b64,
+        "ui_image_mime": ui_image_mime,
+    }
+
+
+# ==============================
+# Unified closed-loop helpers
+# ==============================
+
+def run_eval_revise_export_pipeline(
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    judge_model_id: str,
+    features: Optional[List[Dict[str, Any]]],
+    cases: List[Dict[str, Any]],
+    rag_chunks: Optional[List[RagChunk]] = None,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+    mode: str = "基于当前用例闭环",
+    enable_semantic_dedup: bool = True,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> AgentState:
+    """Evaluate -> revise -> re-evaluate -> export for an existing set of cases.
+
+    This is the key difference from the old implementation: the Agent closed loop
+    no longer assumes it must always run the LangGraph/precise generator first.
+    It can start from the current table, from a quick-generation result, or from
+    a precise-generation result. LangGraph is only an optional orchestration layer,
+    not a separate visible generation mode.
+    """
+    def report(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+
+    rag_chunks = rag_chunks or []
+    features = features or []
+    cases = cases or []
+
+    if not cases:
+        raise RuntimeError("当前没有可用于闭环评测的测试用例。请先生成用例，或选择“快速生成后闭环/精细生成后闭环”。")
+
+    if not features:
+        report("0/7 当前没有功能点列表，正在补充抽取功能点用于覆盖率评测...")
+        features = extract_features(
+            prd_text=prd_text,
+            guidelines=guidelines,
+            api_key=api_key,
+            model_id=model_id,
+            rag_chunks=rag_chunks,
+            ui_image_b64=ui_image_b64,
+            ui_image_mime=ui_image_mime,
+        )
+
+    report("1/7 正在进行初版规则评测...")
+    metrics_v1 = compute_basic_metrics(cases)
+    append_version_history("闭环输入版本", mode, features, cases, metrics_v1, note="作为本次 Agent 闭环的起点")
+
+    report("2/7 正在进行功能点覆盖检查...")
+    coverage_result = feature_coverage_by_similarity(features, cases)
+    append_version_history("功能点覆盖检查", mode, features, cases, metrics_v1, coverage_result=coverage_result)
+
+    report("3/7 正在调用 LLM Judge 质量评审...")
+    judge_result = judge_by_llm(api_key, judge_model_id or model_id, prd_text, cases)
+    append_version_history("LLM质量评审", mode, features, cases, metrics_v1, coverage_result=coverage_result, judge_result=judge_result)
+
+    report("4/7 正在进行疑似幻觉检测...")
+    hallucination_result = hallucination_check_by_llm(api_key, judge_model_id or model_id, prd_text, guidelines, cases)
+    append_version_history("疑似幻觉检测", mode, features, cases, metrics_v1, coverage_result=coverage_result, judge_result=judge_result, hallucination_result=hallucination_result)
+
+    report("5/7 正在根据评审结果自动修正用例...")
+    revised_cases = improve_cases_with_llm(
+        api_key=api_key,
+        model_id=judge_model_id or model_id,
+        prd_text=prd_text,
+        guidelines=guidelines,
+        cases=cases,
+        judge_result=judge_result,
+        coverage_result=coverage_result,
+        hallucination_result=hallucination_result,
+    )
+    revised_cases = rule_dedup_cases(revised_cases)
+    if enable_semantic_dedup:
+        revised_cases = semantic_dedup_cases(revised_cases)
+
+    report("6/7 正在对修正版再次评测...")
+    final_metrics = compute_basic_metrics(revised_cases)
+    final_coverage = feature_coverage_by_similarity(features, revised_cases)
+    append_version_history(
+        "闭环修正完成",
+        mode,
+        features,
+        revised_cases,
+        final_metrics,
+        coverage_result=final_coverage,
+        judge_result=judge_result,
+        hallucination_result=hallucination_result,
+        note=f"修正前 {len(cases)} 条，修正后 {len(revised_cases)} 条",
+    )
+
+    report("7/7 正在生成导出文件...")
+    prepare_export_artifacts(revised_cases, features, final_metrics)
+    append_version_history("导出文件已生成", mode, features, revised_cases, final_metrics, coverage_result=final_coverage, note="CSV/Markdown/Excel 已缓存")
+
+    return {
+        "prd_text": prd_text,
+        "guidelines": guidelines,
+        "features": features,
+        "cases": cases,
+        "eval_result": final_metrics,
+        "coverage_result": final_coverage,
+        "judge_result": judge_result,
+        "hallucination_result": hallucination_result,
+        "final_cases": revised_cases,
+        "api_key": api_key,
+        "model_id": model_id,
+        "judge_model_id": judge_model_id,
+        "ui_image_b64": ui_image_b64,
+        "ui_image_mime": ui_image_mime,
+    }
+
+
+def run_unified_agent_closed_loop(
+    closed_loop_entry: str,
+    prd_text: str,
+    guidelines: str,
+    api_key: str,
+    model_id: str,
+    judge_model_id: str,
+    rag_chunks: Optional[List[RagChunk]] = None,
+    current_features: Optional[List[Dict[str, Any]]] = None,
+    current_cases: Optional[List[Dict[str, Any]]] = None,
+    ui_image_b64: Optional[str] = None,
+    ui_image_mime: Optional[str] = None,
+    max_workers: int = 4,
+    enable_semantic_dedup: bool = True,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> AgentState:
+    """One unified entry for Tab3.
+
+    Supported entries:
+    - 基于当前用例闭环：does not regenerate; starts from the editable table.
+    - 快速生成后闭环：quick generator first, then evaluation/revision/export.
+    - 精细生成后闭环：precise feature-based generator first, then evaluation/revision/export.
+
+    This removes the redundant LangGraph button from Tab2. If LangGraph is kept in
+    the codebase, it is an internal orchestration choice rather than a product mode.
+    """
+    rag_chunks = rag_chunks or []
+    current_features = current_features or []
+    current_cases = current_cases or []
+
+    def report(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+
+    if closed_loop_entry.startswith("基于当前"):
+        return run_eval_revise_export_pipeline(
+            prd_text=prd_text,
+            guidelines=guidelines,
+            api_key=api_key,
+            model_id=model_id,
+            judge_model_id=judge_model_id,
+            features=current_features,
+            cases=current_cases,
+            rag_chunks=rag_chunks,
+            ui_image_b64=ui_image_b64,
+            ui_image_mime=ui_image_mime,
+            mode="基于当前用例闭环",
+            enable_semantic_dedup=enable_semantic_dedup,
+            progress_callback=progress_callback,
+        )
+
+    if closed_loop_entry.startswith("快速"):
+        report("0/7 正在使用快速模式生成闭环初版用例...")
+        features, cases = generate_cases_quick(
+            prd_text=prd_text,
+            guidelines=guidelines,
+            api_key=api_key,
+            model_id=model_id,
+            rag_chunks=rag_chunks,
+            ui_image_b64=ui_image_b64,
+            ui_image_mime=ui_image_mime,
+        )
+        return run_eval_revise_export_pipeline(
+            prd_text=prd_text,
+            guidelines=guidelines,
+            api_key=api_key,
+            model_id=model_id,
+            judge_model_id=judge_model_id,
+            features=features,
+            cases=cases,
+            rag_chunks=rag_chunks,
+            ui_image_b64=ui_image_b64,
+            ui_image_mime=ui_image_mime,
+            mode="快速生成后闭环",
+            enable_semantic_dedup=enable_semantic_dedup,
+            progress_callback=progress_callback,
+        )
+
+    # 默认使用精细模式：这是推荐的 Agent 闭环起点。
+    report("0/7 正在使用精细模式生成闭环初版用例...")
+    features, cases = generate_cases_pipeline(
+        prd_text=prd_text,
+        guidelines=guidelines,
+        api_key=api_key,
+        model_id=model_id,
+        rag_chunks=rag_chunks,
+        progress_callback=None,
+        enable_semantic_dedup=enable_semantic_dedup,
+        ui_image_b64=ui_image_b64,
+        ui_image_mime=ui_image_mime,
+        max_workers=max_workers,
+    )
+    return run_eval_revise_export_pipeline(
+        prd_text=prd_text,
+        guidelines=guidelines,
+        api_key=api_key,
+        model_id=model_id,
+        judge_model_id=judge_model_id,
+        features=features,
+        cases=cases,
+        rag_chunks=rag_chunks,
+        ui_image_b64=ui_image_b64,
+        ui_image_mime=ui_image_mime,
+        mode="精细生成后闭环",
+        enable_semantic_dedup=enable_semantic_dedup,
+        progress_callback=progress_callback,
+    )
+
+# ==============================
+# Optional LangGraph workflow
+# ==============================
+
+def run_langgraph_workflow(state: AgentState) -> AgentState:
+    """
+    LangGraph Agent 全流程闭环（面向 AI 应用开发 / Agent 开发岗位的主流程）。
+
+    产品逻辑：
+    - Tab2 只做初版生成和人工查看；
+    - Tab3 只暴露 LangGraph Agent 闭环；
+    - LangGraph 负责编排：生成/读取初版 -> 评测 -> 条件判断 -> 多轮修正 -> 再评测 -> 导出。
+
+    支持两种启动方式：
+    1. start_mode="from_prd"：从 PRD 重新抽取功能点并生成初版用例；
+    2. start_mode="from_current"：基于 Tab2 当前初版用例继续闭环；若没有功能点，会自动从 PRD 抽取。
+
+    说明：LangGraph 不负责“让模型更聪明”，它负责让工作流可分支、可循环、可追踪、可扩展。
+    """
+    rag_chunks = [RagChunk(**x) for x in state.get("rag_docs", [])]
+
+    state.setdefault("round", 0)
+    state.setdefault("max_rounds", 2)
+    state.setdefault("target_coverage", 0.85)
+    state.setdefault("max_hallucination_cases", 0)
+    state.setdefault("min_overall_score", 8.0)
+    state.setdefault("human_match_threshold", 0.45)
+    state.setdefault("history", [])
+    state.setdefault("start_mode", "from_prd")
+
+    def _record(s: AgentState, stage: str, message: str) -> AgentState:
+        s.setdefault("history", [])
+        s["history"].append({
+            "stage": stage,
+            "message": message,
+            "round": s.get("round", 0),
+            "time": now_str(),
+        })
+        return s
+
+    def _human_df_from_state(s: AgentState) -> pd.DataFrame:
+        records = s.get("human_cases_records") or []
+        if not records:
+            return pd.DataFrame()
+        try:
+            return pd.DataFrame(records)
+        except Exception:
+            return pd.DataFrame()
+
+    # 如果没安装 langgraph，降级运行同样的闭环逻辑，保证演示不崩。
+    if not HAS_LANGGRAPH:
+        out = run_closed_loop_pipeline(
+            prd_text=state["prd_text"],
+            guidelines=state.get("guidelines", ""),
+            api_key=state["api_key"],
+            model_id=state["model_id"],
+            judge_model_id=state.get("judge_model_id") or state["model_id"],
+            rag_chunks=rag_chunks,
+            ui_image_b64=state.get("ui_image_b64"),
+            ui_image_mime=state.get("ui_image_mime"),
+            mode="LangGraph Agent 全流程闭环(fallback)",
+            max_workers=int(state.get("max_workers", 4)),
+            enable_semantic_dedup=bool(state.get("enable_semantic_dedup", True)),
+        )
+        human_df = _human_df_from_state(state)
+        if not human_df.empty:
+            out["human_eval_result"] = evaluate_against_human_semantic(
+                out.get("final_cases", out.get("cases", [])),
+                human_df,
+                threshold=float(state.get("human_match_threshold", 0.45)),
+            )
+        out.setdefault("history", [])
+        out["history"].append({
+            "stage": "fallback",
+            "message": "当前环境未安装 langgraph，已降级为普通闭环 pipeline。建议安装 langgraph 展示状态图编排能力。",
+            "round": 0,
+            "time": now_str(),
+        })
+        return out
+
+    def node_prepare_initial(s: AgentState) -> AgentState:
+        """准备初版：从 PRD 生成，或接收 Tab2 当前用例。"""
+        chunks = [RagChunk(**x) for x in s.get("rag_docs", [])]
+        start_mode = s.get("start_mode", "from_prd")
+
+        if start_mode == "from_current":
+            initial_cases = s.get("initial_cases") or []
+            if not initial_cases:
+                raise RuntimeError("选择了‘基于当前初版用例闭环’，但当前没有测试用例。请先在 Tab2 生成初版用例。")
+            features = s.get("initial_features") or []
+            if not features:
+                features = extract_features(
+                    prd_text=s["prd_text"],
+                    guidelines=s.get("guidelines", ""),
+                    api_key=s["api_key"],
+                    model_id=s["model_id"],
+                    rag_chunks=chunks,
+                    ui_image_b64=s.get("ui_image_b64"),
+                    ui_image_mime=s.get("ui_image_mime"),
+                )
+            cases = renumber_cases(rule_dedup_cases(initial_cases))
+            if bool(s.get("enable_semantic_dedup", True)):
+                cases = semantic_dedup_cases(cases)
+            mode_label = "LangGraph基于当前初版闭环"
+        else:
+            features, cases = generate_cases_pipeline(
+                prd_text=s["prd_text"],
+                guidelines=s.get("guidelines", ""),
+                api_key=s["api_key"],
+                model_id=s["model_id"],
+                rag_chunks=chunks,
+                progress_callback=None,
+                enable_semantic_dedup=bool(s.get("enable_semantic_dedup", True)),
+                ui_image_b64=s.get("ui_image_b64"),
+                ui_image_mime=s.get("ui_image_mime"),
+                max_workers=int(s.get("max_workers", 4)),
+            )
+            mode_label = "LangGraph从PRD生成并闭环"
+
+        s["features"] = features
+        s["cases"] = cases
+        s["final_cases"] = cases
+        s["round"] = 0
+        s["mode_label"] = mode_label
+
+        metrics = compute_basic_metrics(cases)
+        s["eval_result"] = metrics
+        append_version_history(
+            "LangGraph初版准备",
+            mode_label,
+            features,
+            cases,
+            metrics,
+            note=f"启动方式={start_mode}，初版 {len(cases)} 条用例，功能点 {len(features)} 个。",
+        )
+        return _record(s, "prepare_initial", f"初版准备完成：{len(features)} 个功能点，{len(cases)} 条用例。")
+
+    def node_evaluate(s: AgentState) -> AgentState:
+        current_cases = s.get("final_cases") or s.get("cases", [])
+        features = s.get("features", [])
+        mode_label = s.get("mode_label", "LangGraph Agent 全流程闭环")
+
+        metrics = compute_basic_metrics(current_cases)
+        coverage_result = feature_coverage_by_similarity(features, current_cases)
+
+        # 为了控制闭环耗时和 LLM 调用成本，Judge / 幻觉检测不一定每轮都执行。
+        # 规则评测、功能点覆盖率、人工基准语义 F1 每轮都执行；
+        # 重模型评审按 eval_strategy 控制：经济 / 标准 / 深度。
+        eval_strategy = str(s.get("eval_strategy", "标准模式"))
+        current_round = int(s.get("round", 0))
+        max_rounds = int(s.get("max_rounds", 2))
+        target_coverage = float(s.get("target_coverage", 0.85))
+        coverage_score_now = float(coverage_result.get("coverage_score", 0.0) or 0.0)
+        likely_to_export = coverage_score_now >= target_coverage or current_round >= max_rounds
+
+        if eval_strategy == "深度模式":
+            run_deep_eval = True
+        elif eval_strategy == "标准模式":
+            run_deep_eval = (current_round == 0) or likely_to_export
+        else:  # 经济模式
+            run_deep_eval = likely_to_export
+
+        if run_deep_eval:
+            judge_result = judge_by_llm(
+                s["api_key"],
+                s.get("judge_model_id") or s["model_id"],
+                s["prd_text"],
+                current_cases,
+            )
+            hallucination_result = hallucination_check_by_llm(
+                s["api_key"],
+                s.get("judge_model_id") or s["model_id"],
+                s["prd_text"],
+                s.get("guidelines", ""),
+                current_cases,
+            )
+        else:
+            judge_result = {
+                "overall_score": 0.0,
+                "completeness_score": 0.0,
+                "clarity_score": 0.0,
+                "comments": f"本轮按{eval_strategy}跳过 LLM Judge，以降低耗时和调用成本。",
+                "skipped": True,
+            }
+            hallucination_result = {
+                "suspicious_cases": [],
+                "summary": f"本轮按{eval_strategy}跳过幻觉检测；最终导出前会在关键轮次执行。",
+                "skipped": True,
+            }
+
+        human_df = _human_df_from_state(s)
+        human_eval_result = {}
+        if not human_df.empty:
+            human_eval_result = evaluate_against_human_semantic(
+                current_cases,
+                human_df,
+                threshold=float(s.get("human_match_threshold", 0.45)),
+            )
+
+        s["eval_result"] = metrics
+        s["coverage_result"] = coverage_result
+        s["judge_result"] = judge_result
+        s["hallucination_result"] = hallucination_result
+        s["human_eval_result"] = human_eval_result
+
+        note_parts = [
+            f"strategy={eval_strategy}",
+            f"deep_eval={'是' if run_deep_eval else '否'}",
+            f"coverage={float(coverage_result.get('coverage_score', 0.0) or 0.0):.2f}",
+            f"overall={float(judge_result.get('overall_score', 0.0) or 0.0):.1f}",
+            f"hallu={len(hallucination_result.get('suspicious_cases', []) or [])}",
+        ]
+        if human_eval_result:
+            note_parts.append(f"human_f1={human_eval_result.get('f1_score', 0.0):.1f}%")
+
+        append_version_history(
+            f"LangGraph第{s.get('round', 0)}轮评测",
+            mode_label,
+            features,
+            current_cases,
+            metrics,
+            coverage_result=coverage_result,
+            judge_result=judge_result,
+            hallucination_result=hallucination_result,
+            note="；".join(note_parts),
+        )
+        return _record(s, "evaluate", f"第{s.get('round', 0)}轮评测完成：" + "；".join(note_parts))
+
+    def node_revise(s: AgentState) -> AgentState:
+        current_cases = s.get("final_cases") or s.get("cases", [])
+        revised = improve_cases_with_llm(
+            api_key=s["api_key"],
+            model_id=s.get("judge_model_id") or s["model_id"],
+            prd_text=s["prd_text"],
+            guidelines=s.get("guidelines", ""),
+            cases=current_cases,
+            judge_result=s.get("judge_result"),
+            coverage_result=s.get("coverage_result"),
+            hallucination_result=s.get("hallucination_result"),
+        )
+        revised = rule_dedup_cases(revised)
+        if bool(s.get("enable_semantic_dedup", True)):
+            revised = semantic_dedup_cases(revised)
+
+        s["final_cases"] = revised
+        s["round"] = int(s.get("round", 0)) + 1
+        metrics = compute_basic_metrics(revised)
+        s["eval_result"] = metrics
+        append_version_history(
+            f"LangGraph第{s.get('round', 0)}轮修正",
+            s.get("mode_label", "LangGraph Agent 全流程闭环"),
+            s.get("features", []),
+            revised,
+            metrics,
+            coverage_result=s.get("coverage_result"),
+            judge_result=s.get("judge_result"),
+            hallucination_result=s.get("hallucination_result"),
+            note=f"修正后 {len(revised)} 条用例。",
+        )
+        return _record(s, "revise", f"完成第{s.get('round', 0)}轮自我修正，当前用例数：{len(revised)}。")
+
+    def node_export(s: AgentState) -> AgentState:
+        final_cases = s.get("final_cases") or s.get("cases", [])
+        features = s.get("features", [])
+        metrics = s.get("eval_result") or compute_basic_metrics(final_cases)
+        prepare_export_artifacts(final_cases, features, metrics)
+        append_version_history(
+            "LangGraph最终导出",
+            s.get("mode_label", "LangGraph Agent 全流程闭环"),
+            features,
+            final_cases,
+            metrics,
+            coverage_result=s.get("coverage_result"),
+            judge_result=s.get("judge_result"),
+            hallucination_result=s.get("hallucination_result"),
+            note="CSV/Markdown/Excel 已缓存，可直接下载。",
+        )
+        return _record(s, "export", f"最终导出完成：{len(final_cases)} 条用例。")
+
+    def decide_next_step(s: AgentState) -> str:
+        coverage_result = s.get("coverage_result") or {}
+        hallucination_result = s.get("hallucination_result") or {}
+        judge_result = s.get("judge_result") or {}
+
+        coverage_score = float(coverage_result.get("coverage_score", 0.0) or 0.0)
+        suspicious_count = len(hallucination_result.get("suspicious_cases", []) or [])
+        overall_score = float(judge_result.get("overall_score", 0.0) or 0.0)
+
+        current_round = int(s.get("round", 0))
+        max_rounds = int(s.get("max_rounds", 2))
+        target_coverage = float(s.get("target_coverage", 0.85))
+        max_hallu = int(s.get("max_hallucination_cases", 0))
+        min_overall_score = float(s.get("min_overall_score", 8.0))
+
+        pass_coverage = coverage_score >= target_coverage
+        pass_hallucination = suspicious_count <= max_hallu
+        # 若 Judge 没有返回有效分数，不把 overall 作为硬门槛，避免流程被模型偶发失败卡死。
+        pass_overall = True if overall_score <= 0 else overall_score >= min_overall_score
+
+        if pass_coverage and pass_hallucination and pass_overall:
+            return "export"
+        if current_round >= max_rounds:
+            return "export"
+        return "revise"
+
+    graph = StateGraph(AgentState)
+    graph.add_node("prepare_initial", node_prepare_initial)
+    graph.add_node("evaluate", node_evaluate)
+    graph.add_node("revise", node_revise)
+    graph.add_node("export", node_export)
+
+    graph.set_entry_point("prepare_initial")
+    graph.add_edge("prepare_initial", "evaluate")
+    graph.add_conditional_edges("evaluate", decide_next_step, {"revise": "revise", "export": "export"})
+    graph.add_edge("revise", "evaluate")
+    graph.add_edge("export", END)
+
+    app = graph.compile()
+    return app.invoke(state)
+
+# ==============================
+# Export builders
+# ==============================
+
+def build_markdown_cases(cases: List[Dict[str, Any]]) -> str:
+    lines: List[str] = [f"# 测试用例文档\n\n生成时间：{now_str()}\n"]
+    module_map: Dict[str, List[Dict[str, Any]]] = {}
+    for c in cases:
+        module_map.setdefault(c.get("module", "未分模块"), []).append(c)
+    for module, group in module_map.items():
+        lines.append(f"\n## 模块：{module}\n")
+        for c in group:
+            lines.append(f"### {c.get('id')} - {c.get('title')}\n")
+            lines.append(f"- **类型**：{c.get('type')}  ")
+            lines.append(f"- **关联功能点**：{c.get('featureId','')}  ")
+            lines.append(f"- **前置条件**：{c.get('precondition') or '无'}\n")
+            if c.get("test_data"):
+                lines.append(f"- **测试数据**：{c.get('test_data')}\n")
+            lines.append("**操作步骤：**")
+            for i, s in enumerate(str(c.get("steps", "")).splitlines(), start=1):
+                if s.strip():
+                    lines.append(f"{i}. {s.strip()}")
+            lines.append("\n**预期结果：**")
+            for i, e in enumerate(str(c.get("expected", "")).splitlines(), start=1):
+                if e.strip():
+                    lines.append(f"{i}. {e.strip()}")
+            lines.append(f"\n**后置处理**：{c.get('post_actions') or '无'}\n")
+            if c.get("risk_note"):
+                lines.append(f"**风险说明**：{c.get('risk_note')}\n")
+    return "\n".join(lines)
+
+
+def build_markmap_md(cases: List[Dict[str, Any]]) -> str:
+    lines = ["# 测试用例结构"]
+    module_map: Dict[str, List[Dict[str, Any]]] = {}
+    for c in cases:
+        module_map.setdefault(c.get("module", "未分模块"), []).append(c)
+    for module, group in module_map.items():
+        lines.append(f"- {module}")
+        for c in group:
+            lines.append(f"  - {c.get('id')} {c.get('title')} [{c.get('type')}]")
+            for s in str(c.get("steps", "")).splitlines()[:3]:
+                if s.strip():
+                    lines.append(f"    - 步骤：{s.strip()}")
+            for e in str(c.get("expected", "")).splitlines()[:1]:
+                if e.strip():
+                    lines.append(f"    - 预期：{e.strip()}")
+    return "\n".join(lines)
+
+
+def build_excel_bytes(cases: List[Dict[str, Any]], features: List[Dict[str, Any]], eval_result: Dict[str, Any]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        pd.DataFrame(cases).to_excel(writer, index=False, sheet_name="TestCases")
+        if features:
+            pd.DataFrame(features).to_excel(writer, index=False, sheet_name="Features")
+        if eval_result:
+            pd.DataFrame([eval_result]).to_excel(writer, index=False, sheet_name="Metrics")
+    output.seek(0)
+    return output.read()
+
+
+def read_uploaded_human_cases(file_obj: Any) -> pd.DataFrame:
+    if file_obj is None:
+        return pd.DataFrame()
+    name = file_obj.name.lower()
+    data = file_obj.getvalue()
+    if name.endswith(".csv"):
+        try:
+            return pd.read_csv(io.BytesIO(data), encoding="utf-8")
+        except Exception:
+            return pd.read_csv(io.BytesIO(data), encoding="gbk")
+    return pd.read_excel(io.BytesIO(data))
+
+
+# ==============================
+# Streamlit UI
+# ==============================
+
+def init_session_state() -> None:
+    defaults = {
+        "prd_text": "",
+        "features": [],
+        "cases": [],
+        "rag_chunks": [],
+        "ui_image_b64": None,
+        "ui_image_mime": None,
+        "judge_result": None,
+        "coverage_result": None,
+        "hallucination_result": None,
+        "eval_result": None,
+        "history": [],
+        "embedding_model_name": "paraphrase-multilingual-MiniLM-L12-v2",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def render_sidebar() -> Dict[str, Any]:
+    with st.sidebar:
+        st.header("⚙️ 模型配置")
+        api_key = st.text_input("火山引擎 Ark API Key", type="password", value=st.session_state.get("ark_api_key", ""), key="ark_api_key")
+        base_url = st.text_input("Ark / OpenAI-compatible API 地址", value=DEFAULT_ARK_URL)
+        model_id = st.text_input("生成模型 ID", value=st.session_state.get("model_id", DEFAULT_MODEL), key="model_id")
+        judge_model_id = st.text_input("评审/修正模型 ID", value=st.session_state.get("judge_model_id", DEFAULT_JUDGE_MODEL), key="judge_model_id")
+        st.caption("若使用非火山接口，请保证兼容 /chat/completions 返回格式。")
+
+        st.divider()
+        st.header("🏢 RAG 知识库")
+        guidelines = st.text_area(
+            "企业测试规范 / 历史缺陷 / 用例策略",
+            height=180,
+            placeholder="例如：\n- 登录失败 5 次应锁定账号 30 分钟\n- 密码字段必须脱敏\n- 管理员操作需要审计日志\n...",
+        )
+        rag_files = st.file_uploader("上传规范/历史用例/缺陷文件（txt/md/csv/xlsx）", type=["txt", "md", "csv", "xlsx", "xls"], accept_multiple_files=True)
+        build_rag = st.button("🔎 构建/刷新本地 RAG 索引")
+        if build_rag:
+            chunks = build_rag_docs_from_inputs(guidelines, rag_files)
+            st.session_state["rag_chunks"] = [asdict(c) for c in chunks]
+            st.success(f"已构建 {len(chunks)} 个知识片段")
+        st.metric("当前 RAG 片段数", len(st.session_state.get("rag_chunks", [])))
+
+        with st.expander("飞书配置", expanded=False):
+            fs_app_id = st.text_input("Feishu App ID", value="")
+            fs_secret = st.text_input("Feishu App Secret", type="password", value="")
+
+        with st.expander("高级选项", expanded=False):
+            use_semantic_dedup = st.checkbox("启用语义去重", value=True)
+            use_langgraph = st.checkbox("启用 LangGraph Agent 闭环入口", value=HAS_LANGGRAPH, disabled=not HAS_LANGGRAPH, help="该选项只影响 Tab3 是否展示 LangGraph Agent 全流程闭环入口；Tab2 不再提供重复的 LangGraph 生成按钮。")
+            max_workers = st.slider("并发功能点生成数", min_value=1, max_value=8, value=4)
+            embedding_model_name = st.text_input("SentenceTransformer 模型名（可选）", value=st.session_state.get("embedding_model_name"))
+            st.session_state["embedding_model_name"] = embedding_model_name
+            st.caption(f"依赖状态：json_repair={HAS_JSON_REPAIR}, markmap={HAS_MARKMAP}, sklearn={HAS_SKLEARN}, sentence-transformers={HAS_ST}, langgraph={HAS_LANGGRAPH}")
+
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model_id": model_id,
+        "judge_model_id": judge_model_id,
+        "guidelines": guidelines,
+        "fs_app_id": fs_app_id,
+        "fs_secret": fs_secret,
+        "use_semantic_dedup": use_semantic_dedup,
+        "use_langgraph": use_langgraph,
+        "max_workers": max_workers,
+    }
+
+
+def render_input_tab(cfg: Dict[str, Any]) -> None:
+    st.subheader("1. 需求输入")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        input_method = st.radio("选择输入来源", ["文本粘贴", "飞书链接解析"], horizontal=True)
+        if input_method == "文本粘贴":
+            st.session_state["prd_text"] = st.text_area("PRD 内容（支持 Markdown）", value=st.session_state.get("prd_text", ""), height=360)
+        else:
+            fs_url = st.text_input("飞书文档链接")
+            if st.button("🔍 解析飞书文档"):
+                with st.spinner("正在读取飞书文档..."):
+                    st.session_state["prd_text"] = get_feishu_content(fs_url, cfg["fs_app_id"], cfg["fs_secret"])
+                    st.success("解析完成")
+            st.text_area("解析后的 PRD 内容", value=st.session_state.get("prd_text", ""), height=360, key="feishu_prd_view")
+    with col2:
+        st.markdown("#### 📸 UI 图辅助")
+        uploaded = st.file_uploader("上传 UI/流程图（PNG/JPG）", type=["png", "jpg", "jpeg"])
+        if uploaded:
+            st.image(uploaded, caption="已上传 UI 图", use_container_width=True)
+            st.session_state["ui_image_b64"] = base64.b64encode(uploaded.getvalue()).decode("utf-8")
+            st.session_state["ui_image_mime"] = getattr(uploaded, "type", None) or "image/png"
+        else:
+            st.session_state["ui_image_b64"] = None
+            st.session_state["ui_image_mime"] = None
+
+        st.markdown("#### RAG 预览")
+        query_preview = st.text_input("输入关键词预览 RAG 检索", value="登录 密码 安全")
+        if st.button("预览检索结果"):
+            chunks = [RagChunk(**x) for x in st.session_state.get("rag_chunks", [])]
+            retrieved = rag_retrieve(query_preview, chunks, top_k=3)
+            if retrieved:
+                for c in retrieved:
+                    st.info(f"来源：{c.source}｜相似度：{c.score:.3f}\n\n{c.text[:400]}")
+            else:
+                st.warning("暂无检索结果，请先构建 RAG 索引。")
+
+
+def render_generation_tab(cfg: Dict[str, Any]) -> None:
+    st.subheader("2. 初版测试用例生成与可视化")
+    st.caption("这里仅负责生成和编辑初版用例；完整的评测、修正、再评测和最终导出统一放在 Tab3 的 Agent 闭环中。")
+    mode = st.radio("初版生成模式", ["快速模式（单轮生成）", "精细模式（功能点分治 + 并发）"], horizontal=True)
+
+    ui_options = ["不使用 UI 图", "PRD + UI 图", "仅使用 UI 图"]
+    ui_mode = st.radio("UI 图使用方式", ui_options, horizontal=True, disabled=st.session_state.get("ui_image_b64") is None)
+
+    start = st.button("🚀 开始生成测试用例", type="primary")
+    if start:
+        prd_text = st.session_state.get("prd_text", "")
+        ui_b64 = st.session_state.get("ui_image_b64")
+        ui_mime = st.session_state.get("ui_image_mime")
+        use_ui = ui_mode in ["PRD + UI 图", "仅使用 UI 图"] and ui_b64 is not None
+        ui_only = ui_mode == "仅使用 UI 图" and ui_b64 is not None
+        if not cfg["api_key"]:
+            st.error("请先配置 Ark API Key")
+            return
+        if not prd_text.strip() and not ui_only:
+            st.warning("请先输入 PRD，或上传 UI 图并选择“仅使用 UI 图”。")
+            return
+        rag_chunks = [RagChunk(**x) for x in st.session_state.get("rag_chunks", [])]
+        progress_bar = st.progress(0)
+        status = st.empty()
+
+        def progress_cb(done: int, total: int) -> None:
+            progress_bar.progress(done / max(total, 1))
+            status.text(f"已完成 {done}/{total} 个功能点")
+
+        try:
+            with st.spinner("正在调用模型生成初版用例，请查看进度..."):
+                if mode.startswith("快速"):
+                    features, cases = generate_cases_quick(
+                        prd_text, cfg["guidelines"], cfg["api_key"], cfg["model_id"], rag_chunks,
+                        ui_b64 if use_ui else None,
+                        ui_mime if use_ui else None,
+                    )
+                else:
+                    features, cases = generate_cases_pipeline(
+                        prd_text, cfg["guidelines"], cfg["api_key"], cfg["model_id"], rag_chunks,
+                        progress_callback=progress_cb,
+                        enable_semantic_dedup=cfg["use_semantic_dedup"],
+                        ui_image_b64=ui_b64 if use_ui else None,
+                        ui_image_mime=ui_mime if use_ui else None,
+                        max_workers=cfg["max_workers"],
+                    )
+                st.session_state["features"] = features
+                st.session_state["cases"] = cases
+                st.session_state["eval_result"] = compute_basic_metrics(cases)
+                append_version_history("初版生成", mode, features, cases, st.session_state["eval_result"])
+                st.success(f"初版生成完成：{len(features)} 个功能点，{len(cases)} 条用例。需要完整闭环优化时，请到 Tab3 执行。")
+        except Exception as e:
+            st.error(f"生成失败：{e}")
+
+    features = st.session_state.get("features", [])
+    cases = st.session_state.get("cases", [])
+    if features:
+        st.markdown("### 功能点列表")
+        st.dataframe(pd.DataFrame(features), use_container_width=True, height=240)
+    if cases:
+        st.markdown("### 测试用例表格（可编辑）")
+        df = pd.DataFrame(cases)
+        edited = st.data_editor(
+            df,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "type": st.column_config.SelectboxColumn("类型", options=ALLOWED_TYPES),
+                "steps": st.column_config.TextColumn("操作步骤", width="large"),
+                "expected": st.column_config.TextColumn("预期结果", width="large"),
+            },
+            key="cases_editor",
+        )
+        st.session_state["cases"] = edited.to_dict(orient="records")
+
+        st.markdown("### 场景类型分布")
+        type_counts = edited["type"].value_counts().reset_index() if "type" in edited.columns else pd.DataFrame()
+        if not type_counts.empty:
+            type_counts.columns = ["类型", "数量"]
+            fig = px.pie(type_counts, names="类型", values="数量", hole=0.35)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### 思维导图")
+        mm_md = build_markmap_md(st.session_state["cases"])
+        if HAS_MARKMAP:
+            markmap(mm_md, height=450)
+        else:
+            st.code(mm_md, language="markdown")
+
+        st.markdown("### 导出")
+        c1, c2, c3 = st.columns(3)
+        csv_bytes = edited.to_csv(index=False).encode("utf-8-sig")
+        c1.download_button("下载 CSV", csv_bytes, file_name="testcases.csv", mime="text/csv")
+        md = build_markdown_cases(st.session_state["cases"])
+        c2.download_button("下载 Markdown", md.encode("utf-8"), file_name="testcases.md", mime="text/markdown")
+        xlsx = build_excel_bytes(st.session_state["cases"], features, st.session_state.get("eval_result") or {})
+        c3.download_button("下载 Excel", xlsx, file_name="testcases.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info("尚未生成用例。")
+
+
+def render_eval_tab(cfg: Dict[str, Any]) -> None:
+    st.subheader("3. LangGraph Agent 闭环、离线评测与自我修正")
+    cases = st.session_state.get("cases", [])
+    features = st.session_state.get("features", [])
+    prd_text = st.session_state.get("prd_text", "")
+
+    st.markdown("### 3.1 LangGraph Agent 一键闭环")
+    st.caption(
+        "现在 Tab3 只保留 LangGraph 作为主闭环入口：它负责把初版准备、规则评测、功能点覆盖、LLM Judge、"
+        "幻觉检测、自我修正、再评测和导出组织成可循环、可分支、可追踪的 Agent 状态图。"
+    )
+
+    if not HAS_LANGGRAPH:
+        st.warning("当前环境未检测到 langgraph。代码会自动降级为普通闭环 pipeline，但为了展示 Agent 开发能力，建议安装：pip install langgraph langchain-core")
+
+    st.info(
+        "最终版产品逻辑：Tab2 只用于快速/精细初版预览；Tab3 是正式 LangGraph Agent 闭环，"
+        "会统一从 PRD / UI / RAG 重新抽取功能点并生成初版，再进行评测、修正和导出。"
+    )
+
+    st.markdown("#### 人工基准用例（可选，但建议在闭环前上传）")
+    st.caption("用于离线评测 AI 用例与人工标准用例的覆盖率、精确率和 F1。闭环执行时会自动纳入版本记录。")
+    uploaded_gold_for_loop = st.file_uploader(
+        "上传人工用例 CSV / Excel（建议包含 title / steps / expected 列）",
+        type=["csv", "xlsx", "xls"],
+        key="gold_for_langgraph_loop",
+    )
+    human_match_threshold = st.slider("人工用例语义匹配阈值", 0.1, 0.9, 0.45, 0.05, key="human_match_threshold_lg")
+
+    with st.expander("LangGraph 闭环阈值与执行策略", expanded=True):
+        lg_eval_strategy = st.radio(
+            "评测策略（控制 LLM 调用次数 / 运行时间）",
+            ["经济模式", "标准模式", "深度模式"],
+            index=1,
+            horizontal=True,
+            help=(
+                "经济模式：中间尽量用规则与语义评测，只有可能导出或达到最大轮数时才做 Judge/幻觉检测；"
+                "标准模式：首轮和可能导出轮做 Judge/幻觉检测；"
+                "深度模式：每轮都做 Judge/幻觉检测，质量更稳但更慢。"
+            ),
+        )
+        lg_max_rounds = st.slider("最大自我修正轮数", 0, 5, 2, help="0 表示只评测和导出，不进入自动修正。")
+        lg_target_coverage = st.slider("目标功能点覆盖率", 0.0, 1.0, 0.85, 0.05)
+        lg_max_hallu = st.number_input("允许的疑似幻觉用例数", min_value=0, max_value=20, value=0, step=1)
+        lg_min_overall = st.slider("最低 LLM Judge 综合分", 0.0, 10.0, 8.0, 0.5)
+        if lg_eval_strategy == "经济模式":
+            st.caption("预计耗时较短：生成/修正仍会调用 LLM，但 Judge 与幻觉检测只在关键轮次执行。")
+        elif lg_eval_strategy == "标准模式":
+            st.caption("推荐答辩使用：首轮定位问题，可能导出轮再次确认质量，兼顾效果与速度。")
+        else:
+            st.caption("质量优先：每轮完整评测，适合小 PRD 或最终验收，但 LLM 调用次数最多。")
+
+    if st.button("🚀 运行 LangGraph Agent 完整闭环并生成最终导出", type="primary"):
+        if not cfg["api_key"]:
+            st.error("请先配置 Ark API Key")
+        elif not prd_text.strip() and not st.session_state.get("ui_image_b64"):
+            st.error("请先输入 PRD，或上传 UI 图。")
+        else:
+            status = st.empty()
+
+            def cb(msg: str) -> None:
+                status.info(msg)
+
+            human_records: List[Dict[str, Any]] = []
+            if uploaded_gold_for_loop is not None:
+                try:
+                    human_df_for_loop = read_uploaded_human_cases(uploaded_gold_for_loop)
+                    human_records = human_df_for_loop.fillna("").to_dict(orient="records")
+                    st.session_state["uploaded_human_cases_records"] = human_records
+                except Exception as e:
+                    st.error(f"人工基准用例读取失败：{e}")
+                    return
+
+            with st.spinner("正在运行 LangGraph Agent 闭环..."):
+                rag_chunks = [RagChunk(**x) for x in st.session_state.get("rag_chunks", [])]
+                cb("正在通过 LangGraph 状态图执行：prepare_initial → evaluate → decide → revise/export ...")
+                state: AgentState = {
+                    "prd_text": prd_text,
+                    "guidelines": cfg["guidelines"],
+                    "api_key": cfg["api_key"],
+                    "model_id": cfg["model_id"],
+                    "judge_model_id": cfg["judge_model_id"],
+                    "rag_docs": [asdict(x) for x in rag_chunks],
+                    "ui_image_b64": st.session_state.get("ui_image_b64"),
+                    "ui_image_mime": st.session_state.get("ui_image_mime"),
+                    "max_workers": cfg["max_workers"],
+                    "enable_semantic_dedup": cfg["use_semantic_dedup"],
+                    "max_rounds": lg_max_rounds,
+                    "target_coverage": lg_target_coverage,
+                    "max_hallucination_cases": int(lg_max_hallu),
+                    "min_overall_score": lg_min_overall,
+                    "human_match_threshold": human_match_threshold,
+                    "human_cases_records": human_records,
+                    "eval_strategy": lg_eval_strategy,
+                    "start_mode": "from_prd",
+                    # 保留 initial_cases / initial_features 字段，便于后续扩展“复用当前初版”的高级入口；
+                    # 当前正式业务流程固定从 PRD 重新生成，保证功能点基准与用例生成一致。
+                    "initial_cases": cases,
+                    "initial_features": features,
+                }
+                out = run_langgraph_workflow(state)
+
+                st.session_state["features"] = out.get("features", [])
+                st.session_state["cases"] = out.get("final_cases", out.get("cases", []))
+                st.session_state["eval_result"] = out.get("eval_result")
+                st.session_state["coverage_result"] = out.get("coverage_result")
+                st.session_state["judge_result"] = out.get("judge_result")
+                st.session_state["hallucination_result"] = out.get("hallucination_result")
+                st.session_state["human_eval_result"] = out.get("human_eval_result")
+                st.session_state["last_langgraph_history"] = out.get("history", [])
+                st.success("LangGraph Agent 闭环已完成，最终用例与导出文件已更新。")
+                st.rerun()
+
+    artifacts = st.session_state.get("export_artifacts") or {}
+    if artifacts:
+        st.markdown("#### 最终导出文件")
+        d1, d2, d3 = st.columns(3)
+        d1.download_button("下载最终 CSV", artifacts.get("csv", b""), file_name="final_testcases.csv", mime="text/csv")
+        d2.download_button("下载最终 Markdown", artifacts.get("markdown", b""), file_name="final_testcases.md", mime="text/markdown")
+        d3.download_button("下载最终 Excel", artifacts.get("excel", b""), file_name="final_testcases.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.caption(f"导出生成时间：{st.session_state.get('export_ready_time', '')}")
+
+    if st.session_state.get("last_langgraph_history"):
+        with st.expander("LangGraph Agent 执行轨迹", expanded=True):
+            st.dataframe(pd.DataFrame(st.session_state["last_langgraph_history"]), use_container_width=True, height=240)
+
+    cases = st.session_state.get("cases", [])
+    features = st.session_state.get("features", [])
+    if not cases:
+        st.info("当前还没有测试用例。可以直接点击上方按钮，让 LangGraph 从 PRD 重新生成并闭环。")
+        return
+
+    st.markdown("### 3.2 当前最终用例质量概览")
+    metrics = compute_basic_metrics(cases)
+    st.session_state["eval_result"] = metrics
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("用例数", metrics["total"])
+    c2.metric("格式合规率", f"{metrics['format_rate'] * 100:.1f}%")
+    c3.metric("冗余度", f"{metrics['redundancy'] * 100:.1f}%")
+    c4.metric("场景丰富度", f"{metrics['type_richness'] * 100:.1f}%")
+    c5.metric("严谨度", f"{metrics['risk_score']:.1f}")
+
+    radar_scores = [
+        metrics["format_rate"] * 100,
+        (1 - metrics["redundancy"]) * 100,
+        metrics["type_richness"] * 100,
+        metrics["risk_score"],
+        100 if metrics["vague_count"] == 0 else max(0, 100 - metrics["vague_count"] * 10),
+    ]
+    radar_labels = ["格式规范", "冗余控制", "场景丰富", "描述严谨", "模糊词控制"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=radar_scores, theta=radar_labels, fill="toself", name="当前版本"))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### 3.3 最近一次闭环评测结果")
+    rr1, rr2, rr3 = st.columns(3)
+    coverage_result = st.session_state.get("coverage_result") or {}
+    judge_result = st.session_state.get("judge_result") or {}
+    hallucination_result = st.session_state.get("hallucination_result") or {}
+    rr1.metric("功能点覆盖率", f"{float(coverage_result.get('coverage_score', 0.0) or 0.0) * 100:.1f}%")
+    rr2.metric("LLM Judge 综合分", f"{float(judge_result.get('overall_score', 0.0) or 0.0):.1f}/10")
+    rr3.metric("疑似幻觉用例数", len(hallucination_result.get("suspicious_cases", []) or []))
+
+    human_eval = st.session_state.get("human_eval_result") or {}
+    if human_eval:
+        st.markdown("#### 人工基准对齐结果")
+        h1, h2, h3 = st.columns(3)
+        h1.metric("人工覆盖率", f"{human_eval.get('coverage_score', 0.0):.1f}%")
+        h2.metric("AI 精确率", f"{human_eval.get('precision_score', 0.0):.1f}%")
+        h3.metric("F1", f"{human_eval.get('f1_score', 0.0):.1f}%")
+        st.caption(human_eval.get("comments", ""))
+        if human_eval.get("matches"):
+            with st.expander("人工用例匹配明细", expanded=False):
+                st.dataframe(pd.DataFrame(human_eval["matches"]), use_container_width=True)
+
+    st.markdown("### 3.4 手动补充人工基准评测（可选）")
+    uploaded_gold_manual = st.file_uploader(
+        "上传人工用例 CSV / Excel 后手动计算当前最终版的覆盖率 / 精确率 / F1",
+        type=["csv", "xlsx", "xls"],
+        key="gold_manual_after_loop",
+    )
+    sim_threshold = st.slider("手动评测语义匹配阈值", 0.1, 0.9, 0.45, 0.05, key="manual_human_threshold")
+    if st.button("计算当前最终版与人工基准的 F1"):
+        try:
+            human_df = read_uploaded_human_cases(uploaded_gold_manual)
+            result = evaluate_against_human_semantic(cases, human_df, threshold=sim_threshold)
+            st.session_state["human_eval_result"] = result
+            append_version_history(
+                "人工基准语义评测",
+                "手动评测",
+                features,
+                cases,
+                metrics,
+                st.session_state.get("coverage_result"),
+                note=f"F1={result.get('f1_score', 0):.1f}%",
+            )
+            a, b, c = st.columns(3)
+            a.metric("覆盖率", f"{result['coverage_score']:.1f}%")
+            b.metric("精确率", f"{result['precision_score']:.1f}%")
+            c.metric("F1", f"{result['f1_score']:.1f}%")
+            st.caption(result.get("comments", ""))
+            if result.get("matches"):
+                st.dataframe(pd.DataFrame(result["matches"]), use_container_width=True)
+        except Exception as e:
+            st.error(f"评测失败：{e}")
+
+def main() -> None:
+    st.set_page_config(page_title=APP_NAME, page_icon="🧬", layout="wide", initial_sidebar_state="expanded")
+    init_session_state()
+    st.title("🧬 智测 AI Agent Pro - PRD 测试用例生成与评测平台")
+    st.caption("支持 PRD / 飞书 / UI 图输入，功能点分治生成、RAG、语义评测、LLM Judge、幻觉检测、自我修正和多格式导出。")
+    cfg = render_sidebar()
+    tab1, tab2, tab3 = st.tabs(["📄 需求输入", "🚀 初版生成 & 可视化", "📊 Agent 闭环评测 & 自我修正"])
+    with tab1:
+        render_input_tab(cfg)
+    with tab2:
+        render_generation_tab(cfg)
+    with tab3:
+        render_eval_tab(cfg)
+
+
+if __name__ == "__main__":
+    main()
